@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - default
+
+task_name: fp32_bs2_views8
+
+data:
+  num_views: 8
+  data_module:
+    batch_size_per_device: 2

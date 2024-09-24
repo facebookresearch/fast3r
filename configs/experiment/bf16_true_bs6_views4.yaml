@@ -1,0 +1,10 @@
+# @package _global_
+
+defaults:
+  - default
+
+task_name: bf16_true_bs6_views4
+
+trainer:
+  precision: bf16-true
+

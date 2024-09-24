@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - default
+
+task_name: arkitscenes_only_no_pairs
+
+data:
+  data_module:
+    train_datasets:
+      - 80_000 @ ARKitScenes_Multiview(split='train', num_views=${data.num_views}, with_pairs=False, num_samples_per_window=10, ROOT='${data.data_root}/arkitscenes_processed', aug_crop=256, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)

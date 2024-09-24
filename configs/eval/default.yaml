@@ -1,0 +1,19 @@
+# @package _global_
+
+data:
+  num_views: 12
+  data_module:
+    num_workers: 0 # debuggers don't like multiprocessing
+    pin_memory: false # disable gpu memory pin
+    batch_size_per_device: 6
+
+trainer:
+  log_every_n_steps: 1
+  devices: auto
+  # fast_dev_run: 1
+  limit_train_batches: 0
+  limit_val_batches: 10000
+
+
+# seed for random number generators in pytorch, numpy and python.random
+seed: 42

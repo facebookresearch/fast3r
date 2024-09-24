@@ -1,0 +1,6 @@
+# @package _global_
+
+defaults:
+  - default
+
+task_name: fp32_bs6_views4
