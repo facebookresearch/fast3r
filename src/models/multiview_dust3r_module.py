@@ -6,8 +6,7 @@ from lightning.pytorch.loggers.wandb import WandbLogger
 from torchmetrics import MaxMetric, MeanMetric, MinMetric, SumMetric, Metric
 from torchmetrics.aggregation import BaseAggregator
 from src.dust3r.model import FlashDUSt3R
-import torch.optim.lr_scheduler as lr_scheduler
-import torch.optim as optim
+from src.models.fast3r import Fast3R
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 
 from src.utils import pylogger
@@ -248,13 +247,13 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
     def _load_pretrained_weights(self) -> None:
         log.info(f"Loading pretrained: {self.pretrained}")
-        ckpt = torch.load(self.pretrained)
-
         if isinstance(self.net, FlashDUSt3R):  # if the model is FlashDUSt3R, use the weights of the first head only
+            ckpt = torch.load(self.pretrained)
             ckpt = self._update_ckpt_keys(ckpt, new_head_name='downstream_head', head_to_keep='downstream_head1', head_to_discard='downstream_head2')
-
-        self.net.load_state_dict(ckpt["model"], strict=False)
-        del ckpt  # in case it occupies memory
+            self.net.load_state_dict(ckpt["model"], strict=False)
+            del ckpt  # in case it occupies memory
+        elif isinstance(self.net, Fast3R):
+            self.net.load_from_dust3r_checkpoint(self.pretrained)
 
     @staticmethod
     def _update_ckpt_keys(ckpt, new_head_name='downstream_head', head_to_keep='downstream_head1', head_to_discard='downstream_head2'):

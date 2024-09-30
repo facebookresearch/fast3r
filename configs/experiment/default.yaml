@@ -24,10 +24,6 @@ hydra:
     root:
       level: INFO
 
-model:
-  net:
-    random_image_idx_embedding: true
-
 data:
   num_views: 4
   data_module:

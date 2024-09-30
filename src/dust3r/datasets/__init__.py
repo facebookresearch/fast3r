@@ -8,6 +8,7 @@ from .blendedmvs import BlendedMVS  # noqa
 from .co3d import Co3d  # noqa
 from .co3d_multiview import Co3d_Multiview  # noqa: F401
 from .habitat import Habitat  # noqa
+from .habitat_multiview import Habitat_Multiview  # noqa
 from .megadepth import MegaDepth  # noqa
 from .megadepth_multiview import MegaDepth_Multiview  # noqa
 from .scannetpp import ScanNetpp  # noqa

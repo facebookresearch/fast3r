@@ -68,7 +68,7 @@ net:
   dec_embed_dim: 768
   dec_depth: 12
   dec_num_heads: 12
-  random_image_idx_embedding: false
+  random_image_idx_embedding: true
 
 
 

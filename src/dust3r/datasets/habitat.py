@@ -44,7 +44,10 @@ class Habitat(BaseStereoViewDataset):
         for view_index in two_random_views:
             # load the view (and use the next one if this one's broken)
             for ii in range(view_index, view_index + 5):
-                image, depthmap, intrinsics, camera_pose = self._load_one_view(data_path, key, ii % 5, resolution, rng)
+                try:
+                    image, depthmap, intrinsics, camera_pose = self._load_one_view(data_path, key, ii % 5, resolution, rng)
+                except FileNotFoundError:
+                    continue  # view does not exist, try the next one
                 if np.isfinite(camera_pose).all():
                     break
             views.append(dict(
