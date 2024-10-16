@@ -136,6 +136,8 @@ class MultiViewDUSt3RDataModule(LightningDataModule):
         # Set epoch for each validation loader (if applicable)
         for loader in val_loaders:
             if hasattr(loader, "dataset") and hasattr(loader.dataset, "set_epoch"):
+                # print the dataset name and length
+                print(f"Dataset: {loader.dataset} | Length: {len(loader.dataset)}")
                 loader.dataset.set_epoch(0)
             if hasattr(loader, "sampler") and hasattr(loader.sampler, "set_epoch"):
                 loader.sampler.set_epoch(0)

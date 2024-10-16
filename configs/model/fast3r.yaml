@@ -80,7 +80,6 @@ net:
       - exp
       - 1
       - !!float inf
-    img_size: 512
     patch_size: 16
     
   freeze: none

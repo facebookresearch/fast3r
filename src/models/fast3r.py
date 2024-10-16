@@ -1,13 +1,14 @@
 import os
 from copy import deepcopy
 import huggingface_hub
+from omegaconf import DictConfig
 import torch
 import torch.distributed
 import torch.nn as nn
 import numpy as np
 from src.dust3r.heads.postprocess import postprocess
 from src.dust3r.heads.dpt_head import PixelwiseTaskWithDPT
-from src.croco.models.blocks import Block
+from src.croco.models.blocks import Block, PositionGetter
 from src.croco.models.pos_embed import RoPE2D, get_1d_sincos_pos_embed_from_grid
 from packaging import version
 from functools import partial
@@ -38,9 +39,9 @@ class Fast3R(nn.Module,
              ):
     def __init__(
         self,
-        encoder_args: dict,
-        decoder_args: dict,
-        head_args: dict,
+        encoder_args: DictConfig,
+        decoder_args: DictConfig,
+        head_args: DictConfig,
         freeze="none",
     ):
         super(Fast3R, self).__init__()
@@ -59,13 +60,15 @@ class Fast3R(nn.Module,
     def build_encoder(self, encoder_args: dict):
         # Initialize the encoder based on the encoder type
         if encoder_args["encoder_type"] == "croco":
-            # drop the encoder_type key
+            # Drop the encoder_type key
             encoder_args = deepcopy(encoder_args)
             encoder_args.pop("encoder_type")
             self.encoder = CroCoEncoder(**encoder_args)
         elif encoder_args["encoder_type"] == "dino_v2":
-            # Load the pretrained dino_v2 model
-            self.encoder = torch.hub.load('facebookresearch/dino', 'dino_v2_vitb16')
+            # Drop the encoder_type key
+            encoder_args = deepcopy(encoder_args)
+            encoder_args.pop("encoder_type")
+            self.encoder = DinoEncoder(**encoder_args)
         else:
             raise ValueError(f"Unsupported encoder type: {encoder_args['encoder_type']}")
 
@@ -76,23 +79,20 @@ class Fast3R(nn.Module,
         self,
         head_args: dict,
     ):
-        assert (
-            head_args['img_size'] % head_args['patch_size'] == 0
-        ), f"{head_args['img_size']=} must be multiple of {head_args['patch_size']=}"
         self.output_mode = head_args['output_mode']
         self.head_type = head_args['head_type']
         self.depth_mode = head_args['depth_mode']
         self.conf_mode = head_args['conf_mode']
         # allocate head
         self.downstream_head = self.head_factory(
-            head_args['head_type'], head_args['output_mode'], has_conf=bool(head_args['conf_mode'])
+            head_args['head_type'], head_args['output_mode'], has_conf=bool(head_args['conf_mode']), patch_size=head_args['patch_size']
         )
         # magic wrapper
         self.head = transpose_to_landscape(
             self.downstream_head, activate=head_args['landscape_only']
         )
 
-    def head_factory(self, head_type, output_mode, has_conf=False):
+    def head_factory(self, head_type, output_mode, has_conf=False, patch_size=16):
         """ " build a prediction head for the decoder"""
         if head_type == "dpt" and output_mode == "pts3d":
             assert self.decoder_args.depth > 9
@@ -112,18 +112,10 @@ class Fast3R(nn.Module,
                 depth_mode=self.head_args.depth_mode,
                 conf_mode=self.head_args.conf_mode,
                 head_type="regression",
+                patch_size=patch_size,
             )
         else:
             raise NotImplementedError(f"unexpected {head_type=} and {output_mode=}")
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, **kw):
-        if os.path.isfile(pretrained_model_name_or_path):
-            return load_model(pretrained_model_name_or_path, device="cpu")
-        else:
-            return super(Fast3R, cls).from_pretrained(
-                pretrained_model_name_or_path, **kw
-            )
 
     def load_state_dict(self, ckpt, **kw):
         return super().load_state_dict(ckpt, **kw)
@@ -136,42 +128,62 @@ class Fast3R(nn.Module,
             dust3r_checkpoint_path (str): Path to the Dust3R checkpoint.
         """
         # Load the checkpoint
-        checkpoint = torch.load(dust3r_checkpoint_path)['model']
+        checkpoint = torch.load(dust3r_checkpoint_path, weights_only=False)['model']
 
         # Initialize state dictionaries for different components
         encoder_state_dict = {}
         downstream_head_state_dict = {}
 
-        # Prepare logging
+        # Prepare to track loaded keys
         loaded_keys = set()
-        not_loaded_keys = set()
 
         # Split the checkpoint into encoder and downstream head
         for key, value in checkpoint.items():
             if key.startswith("patch_embed") or key.startswith("enc_blocks") or key.startswith("enc_norm"):
-                # These are encoder components
                 if isinstance(self.encoder, CroCoEncoder):
                     new_key = key.replace("patch_embed", "encoder.patch_embed") \
-                                .replace("enc_blocks", "encoder.enc_blocks") \
-                                .replace("enc_norm", "encoder.enc_norm")
+                                 .replace("enc_blocks", "encoder.enc_blocks") \
+                                 .replace("enc_norm", "encoder.enc_norm")
                     encoder_state_dict[new_key] = value
-                    loaded_keys.add(key)  # Store full key
-                else:
-                    not_loaded_keys.add(key)
+                    loaded_keys.add(key)  # Tentatively mark as loaded
             elif key.startswith("downstream_head1"):
-                # These are for downstream_head
                 new_key = key.replace("downstream_head1", "downstream_head")
                 downstream_head_state_dict[new_key] = value
-                loaded_keys.add(key)  # Store full key
-            else:
-                not_loaded_keys.add(key)
+                loaded_keys.add(key)  # Tentatively mark as loaded
 
         # Load the encoder part into the model if it is an instance of CroCoEncoder
         if isinstance(self.encoder, CroCoEncoder):
-            self.encoder.load_state_dict(encoder_state_dict, strict=False)
+            load_result = self.load_state_dict(encoder_state_dict, strict=False)
 
-        # Load the downstream head part into the model
-        self.downstream_head.load_state_dict(downstream_head_state_dict, strict=False)
+            # Remove keys that failed to load
+            missing_keys = set(load_result.missing_keys)
+            unexpected_keys = set(load_result.unexpected_keys)
+            loaded_keys -= (missing_keys | unexpected_keys)
+
+        # Load the downstream head part into the model with try-catch logic
+        # Save the original downstream head state to restore in case of failure
+        downstream_head_original_state = {k: v.clone() for k, v in self.downstream_head.state_dict().items()}
+        try:
+            load_result = self.load_state_dict(downstream_head_state_dict, strict=False)
+
+            # Remove keys that failed to load
+            missing_keys = set(load_result.missing_keys)
+            unexpected_keys = set(load_result.unexpected_keys)
+            loaded_keys -= (missing_keys | unexpected_keys)
+        except RuntimeError as e:
+            log.warning(f"Error loading downstream head: {str(e)}")
+            log.warning("Reverting downstream head to its original state")
+            # Revert downstream head to its original state
+            self.downstream_head.load_state_dict(downstream_head_original_state)
+
+            del downstream_head_original_state
+
+            # Remove downstream head keys from loaded_keys, as they were not loaded
+            loaded_keys -= set([key for key in checkpoint.keys() if key.startswith("downstream_head1")])
+
+        # Compute not loaded keys as difference between all checkpoint keys and loaded keys
+        checkpoint_keys = set(checkpoint.keys())
+        not_loaded_keys = checkpoint_keys - loaded_keys
 
         del checkpoint
 
@@ -199,6 +211,7 @@ class Fast3R(nn.Module,
         # TODO: Batchify this
         for view in views:
             img = view["img"]
+            # Recover true_shape when available, otherwise assume that the img shape is the true one
             true_shape = view.get(
                 "true_shape", torch.tensor(img.shape[-2:])[None].repeat(B, 1)
             )
@@ -365,6 +378,99 @@ class CroCoEncoder(nn.Module):
         x = self.enc_norm(x)
         return x, pos
 
+class DinoEncoder(nn.Module):
+    def __init__(
+        self,
+        patch_size=14,
+        **kwargs
+    ):
+        super(DinoEncoder, self).__init__()
+        # Load the pretrained DINOv2 model
+        self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+        assert self.model.patch_size == patch_size == 14, "DINOv2 model must have patch size 14"
+        self.patch_size = patch_size
+        self.position_getter = PositionGetter()
+
+    def forward(self, image, true_shape):
+        # image shape: B x C x H x W
+        B, C, H, W = image.shape
+
+        # Split the batch into landscape and portrait based on true_shape
+        landscape_mask = true_shape[:, 1] >= true_shape[:, 0]  # width >= height (landscape)
+        portrait_mask = ~landscape_mask  # width < height (portrait)
+
+        # Calculate the number of patches for the largest resolution in the batch
+        true_height = true_shape[:, 0]  # Index 0 is height
+        true_width = true_shape[:, 1]   # Index 1 is width
+        num_patches_h = true_height // self.patch_size
+        num_patches_w = true_width // self.patch_size
+        num_patches = num_patches_h * num_patches_w  # Total number of patches
+
+        # Pre-allocate tensors for the output
+        encoded_feats = torch.empty((B, num_patches.max(), self.model.embed_dim), dtype=next(self.named_parameters())[1].dtype, device=image.device)
+        encoded_pos = torch.empty((B, num_patches.max(), 2), dtype=torch.long, device=image.device)
+
+        # If there are landscape images, process them
+        if landscape_mask.any():
+            landscape_images = image[landscape_mask]
+            landscape_shapes = true_shape[landscape_mask]
+            landscape_features, landscape_pos = self._process_images(landscape_images, landscape_shapes)
+            encoded_feats[landscape_mask] = landscape_features
+            encoded_pos[landscape_mask] = landscape_pos
+
+        # If there are portrait images, process them
+        if portrait_mask.any():
+            portrait_images = image[portrait_mask]
+            portrait_shapes = true_shape[portrait_mask]
+
+            # Transpose the portrait images back to their original orientation
+            portrait_images_transposed = portrait_images.transpose(2, 3)  # HxW -> WxH
+            portrait_features, portrait_pos = self._process_images(portrait_images_transposed, portrait_shapes)
+
+            # Unflatten the features, transpose back to match original batch order, then flatten again
+            num_patches_h = portrait_shapes[:, 0] // self.patch_size  # Use true height
+            num_patches_w = portrait_shapes[:, 1] // self.patch_size  # Use true width
+            B_p, N, D = portrait_features.shape
+
+            # Unflatten the features to (B, num_patches_h, num_patches_w, D)
+            portrait_features_unflattened = portrait_features.view(B_p, num_patches_h[0], num_patches_w[0], D)
+
+            # Transpose back (swap height and width)
+            portrait_features_transposed = portrait_features_unflattened.transpose(1, 2)
+
+            # Flatten again to match the expected shape
+            portrait_features_flattened = portrait_features_transposed.flatten(1, 2)
+
+            # Apply the same operation for positional embeddings (pos)
+            B_p, N, _ = portrait_pos.shape  # Get the shape for pos
+            portrait_pos_unflattened = portrait_pos.view(B_p, num_patches_h[0], num_patches_w[0], 2)
+            portrait_pos_transposed = portrait_pos_unflattened.transpose(1, 2)
+            portrait_pos_flattened = portrait_pos_transposed.flatten(1, 2)
+
+            # Assign the processed features and positional embeddings back
+            encoded_feats[portrait_mask] = portrait_features_flattened
+            encoded_pos[portrait_mask] = portrait_pos_flattened
+
+        return encoded_feats, encoded_pos
+
+    def _process_images(self, images, true_shape):
+        """
+        Process a batch of images through the DINO encoder and compute positions.
+        """
+        # Forward pass through the DINO encoder to get encoded features
+        features = self.model.forward_features(images)['x_norm_patchtokens']  # Shape: B x N_patches x D
+        x = features  # Encoded features
+
+        # Compute positions using PositionGetter
+        true_height = true_shape[:, 0]  # Explicitly assign height
+        true_width = true_shape[:, 1]   # Explicitly assign width
+        num_patches_h = true_height // self.patch_size  # Height patches
+        num_patches_w = true_width // self.patch_size  # Width patches
+        pos = self.position_getter(images.shape[0], num_patches_h[0], num_patches_w[0], images.device)
+
+        return x, pos
+
+
 class Fast3RDecoder(nn.Module):
     def __init__(
         self,
@@ -392,7 +498,7 @@ class Fast3RDecoder(nn.Module):
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
                 drop=drop,
-                attn_drop= attn_drop,
+                attn_drop=attn_drop,
                 norm_layer=nn.LayerNorm,
                 attn_implementation=attn_implementation,
             ) for _ in range(depth)

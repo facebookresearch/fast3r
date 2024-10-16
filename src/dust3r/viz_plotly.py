@@ -10,6 +10,13 @@ class SceneViz:
     def __init__(self):
         self.fig = go.Figure()
 
+    def export_html(self, filename="scene_visualization.html"):
+        """Exports the current figure to a self-contained HTML file."""
+        # Use Plotly's write_html to save the figure as a standalone HTML file
+        self.fig.write_html(filename, include_plotlyjs='cdn', full_html=True)
+
+        print(f"Visualization exported to {filename}")
+
     def add_pointcloud(self, pts3d, color, mask=None, point_size=1, view_idx=0):
         """Adds a point cloud to the Plotly figure using original colors."""
         pts3d = np.array(pts3d)

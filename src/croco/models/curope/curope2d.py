@@ -11,7 +11,7 @@ except ModuleNotFoundError:
 
 class cuRoPE2D_func(torch.autograd.Function):
     @staticmethod
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    @torch.amp.custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def forward(ctx, tokens, positions, base, F0=1):
         ctx.save_for_backward(positions)
         ctx.saved_base = base
@@ -22,7 +22,7 @@ class cuRoPE2D_func(torch.autograd.Function):
         return tokens
 
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_res):
         positions, base, F0 = ctx.saved_tensors[0], ctx.saved_base, ctx.saved_F0
         _kernels.rope_2d(grad_res, positions, base, -F0)

@@ -303,7 +303,7 @@ def fast_pnp(pts3d, focal, msk, device, pp=None, niter_PnP=10):
 
     if focal is None:
         S = max(W, H)
-        tentative_focals = np.geomspace(S / 2, S * 3, 21)
+        tentative_focals = np.geomspace(S / 2, S * 3, num=100)
     else:
         tentative_focals = [focal]
 
@@ -316,16 +316,19 @@ def fast_pnp(pts3d, focal, msk, device, pp=None, niter_PnP=10):
     for focal in tentative_focals:
         K = np.float32([(focal, 0, pp[0]), (0, focal, pp[1]), (0, 0, 1)])
 
-        success, R, T, inliers = cv2.solvePnPRansac(
-            pts3d[msk],
-            pixels[msk],
-            K,
-            None,
-            iterationsCount=niter_PnP,
-            reprojectionError=5,
-            flags=cv2.SOLVEPNP_SQPNP,
-        )
-        if not success:
+        try:  # solvePnPRansac is not always solvable, especially when the predicted points are not very good
+            success, R, T, inliers = cv2.solvePnPRansac(
+                pts3d[msk],
+                pixels[msk],
+                K,
+                None,
+                iterationsCount=niter_PnP,
+                reprojectionError=5,
+                flags=cv2.SOLVEPNP_SQPNP,
+            )
+            if not success:
+                continue
+        except cv2.error:
             continue
 
         score = len(inliers)
@@ -333,7 +336,7 @@ def fast_pnp(pts3d, focal, msk, device, pp=None, niter_PnP=10):
             best = score, R, T, focal
 
     if not best[0]:
-        return None
+        return None, None
 
     _, R, T, best_focal = best
     R = cv2.Rodrigues(R)[0]  # world to cam

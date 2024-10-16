@@ -1,0 +1,8 @@
+# @package _global_
+
+defaults:
+  - default
+  - override /model: fast3r
+
+task_name: fast3r_habitat_co3d_scannetpp_arkitscenes
+

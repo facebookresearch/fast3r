@@ -351,7 +351,10 @@ class DPTOutputAdapter(nn.Module):
                 nn.Conv2d(
                     feature_dim, feature_dim // 2, kernel_size=3, stride=1, padding=1
                 ),
-                Interpolate(scale_factor=2, mode="bilinear", align_corners=True),
+                # the act_postprocess layers upsample each patch by 8 in total,
+                # so self.patch_size / 8 calculates how much more we need to upsample
+                # to get to the full image size (remember that num_patches = image_size / patch_size)
+                Interpolate(scale_factor=self.patch_size[0] / 8, mode="bilinear", align_corners=True),
                 nn.Conv2d(
                     feature_dim // 2, last_dim, kernel_size=3, stride=1, padding=1
                 ),

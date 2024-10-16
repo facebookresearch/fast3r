@@ -5,9 +5,14 @@ from lightning import LightningModule
 from lightning.pytorch.loggers.wandb import WandbLogger
 from torchmetrics import MaxMetric, MeanMetric, MinMetric, SumMetric, Metric
 from torchmetrics.aggregation import BaseAggregator
+from src.dust3r.post_process import estimate_focal_knowing_depth_and_confidence_mask
 from src.dust3r.model import FlashDUSt3R
 from src.models.fast3r import Fast3R
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
+from src.eval.cam_pose_metric import camera_to_rel_deg, calculate_auc
+from src.dust3r.cloud_opt.init_im_poses import fast_pnp
+
+from concurrent.futures import ThreadPoolExecutor
 
 from src.utils import pylogger
 
@@ -61,6 +66,17 @@ class MultiViewDUSt3RLitModule(LightningModule):
         self.train_total_images = AccululatedSum()  # these need to be reduced across GPUs, so use Metric
 
         self.val_loss = MeanMetric()
+
+        # Initialize metrics
+        self.RRA_thresholds = [5, 15, 30]
+        self.RTA_thresholds = [5, 15, 30]
+        # Initialize RRA and RTA metrics as attributes
+        for tau in self.RRA_thresholds:
+            setattr(self, f'val_RRA_{tau}', MeanMetric())
+        for tau in self.RTA_thresholds:
+            setattr(self, f'val_RTA_{tau}', MeanMetric())
+
+        self.val_mAA = MeanMetric()
 
     def forward(self, views: List[Dict[str, torch.Tensor]]) -> Any:
         return self.net(views)
@@ -172,6 +188,10 @@ class MultiViewDUSt3RLitModule(LightningModule):
                     batch_size=batch_size,
                 )
 
+        # Evaluate metrics for camera poses
+        if dataset_name == "Co3d_v2":
+            self.evaluate_camera_poses(views, preds, estimate_focal_from_first_view=True)
+
         return loss
 
     def on_validation_epoch_end(self) -> None:
@@ -186,6 +206,153 @@ class MultiViewDUSt3RLitModule(LightningModule):
     #     self, batch: List[Dict[str, torch.Tensor]], batch_idx: int
     # ) -> None:
     #     pass
+
+    def evaluate_camera_poses(self, views, preds, estimate_focal_from_first_view=False):
+        """Evaluate camera poses and focal lengths using fast_pnp in parallel."""
+        batch_size = views[0]["img"].shape[0]
+
+        # Estimate camera poses using the provided function
+        poses_c2w_estimated, estimated_focals = self.estimate_camera_poses(preds=preds, views=views, niter_PnP=10, device=self.device, estimate_focal_from_first_view=estimate_focal_from_first_view)
+
+        # Get ground truth poses
+        poses_c2w_gt = [view['camera_pose'] for view in views]
+
+        # Convert poses to tensors
+        device = self.device
+        pred_cameras = torch.tensor(np.stack(poses_c2w_estimated), device=device)  # Shape (B, num_views, 4, 4)
+        gt_cameras = torch.stack(poses_c2w_gt).transpose(0, 1)  # (B, num_views, 4, 4)
+
+        # compute the metrics: RRA, RTA, mAA
+        # Ensure we have enough poses to compute relative errors
+        if pred_cameras.shape[1] >= 2:
+
+            def process_sample(sample_idx):
+                my_preds = preds
+                my_views = views
+
+                # Extract camera poses for the current sample
+                pred_sample = pred_cameras[sample_idx]  # Shape (num_views, 4, 4)
+                gt_sample = gt_cameras[sample_idx]      # Shape (num_views, 4, 4)
+
+                # Compute relative rotation and translation errors
+                rel_rangle_deg, rel_tangle_deg = camera_to_rel_deg(pred_sample, gt_sample, device, len(pred_sample))
+
+                # Compute metrics for all tau thresholds
+                results = {}
+                for tau in self.RRA_thresholds:
+                    results[f"RRA_at_{tau}"] = (rel_rangle_deg < tau).float().mean().item()
+                for tau in self.RTA_thresholds:
+                    results[f"RTA_at_{tau}"] = (rel_tangle_deg < tau).float().mean().item()
+
+                # Compute mAA(30)
+                results['mAA_30'] = calculate_auc(rel_rangle_deg, rel_tangle_deg, max_threshold=30).item()
+
+                return results
+
+            # Use ThreadPoolExecutor to process samples in parallel across the batch
+            with ThreadPoolExecutor() as executor:
+                batch_results = list(executor.map(process_sample, range(batch_size)))
+
+            # Update metrics for all samples in the batch
+            for results in batch_results:
+                for tau in self.RRA_thresholds:
+                    getattr(self, f'val_RRA_{tau}')(results[f"RRA_at_{tau}"])
+                    self.log(f"val/RRA_at_{tau}", getattr(self, f'val_RRA_{tau}'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+                for tau in self.RTA_thresholds:
+                    getattr(self, f'val_RTA_{tau}')(results[f"RTA_at_{tau}"])
+                    self.log(f"val/RTA_at_{tau}", getattr(self, f'val_RTA_{tau}'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+                self.val_mAA(results['mAA_30'])
+                self.log("val/mAA_30", self.val_mAA, on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+
+        else:
+            log.warning("Not enough camera poses to compute relative errors.")
+
+    # Function to estimate camera poses using fast_pnp
+    @staticmethod
+    def estimate_camera_poses(preds, views=None, niter_PnP=10, device='cpu', estimate_focal_from_first_view=False):
+        """Estimate camera poses and focal lengths using fast_pnp in parallel."""
+        # correct the shape of the predicted points and confidence maps if the view is portrait
+        # this is because the data loader transposed the input images and valid_masks to landscape
+        # see datasets/base/base_stereo_view_dataset.py
+        if views is not None:
+            for pred, view in zip(preds, views):
+                # debug: use GT point map to estimate poses
+                # pred["pts3d_in_other_view"] = view["pts3d"]  # shape (B, H, W, 3)
+                # pred["conf"] = view['valid_mask'].float() if "valid_mask" in view else torch.ones_like(pred["conf"])  # shape (B, H, W)
+                # pred["focal_length"] = view["camera_intrinsics"][:, 0, :2].sum(1)
+                # end debug
+
+                # check if the view is protrait or landscape (true_shape: (H, W))
+                conf_list = []
+                pts3d_list = []
+
+                for i in range(view["true_shape"].shape[0]):
+                    H, W = view["true_shape"][i]
+                    if H > W:  # portrait
+                        # Transpose the tensors
+                        transposed_conf = pred["conf"][i].transpose(0, 1)
+                        transposed_pts3d = pred["pts3d_in_other_view"][i].transpose(0, 1)
+
+                        # Append the transposed tensors to the lists
+                        conf_list.append(transposed_conf)
+                        pts3d_list.append(transposed_pts3d)
+                    else:
+                        # Append the original tensors to the lists
+                        conf_list.append(pred["conf"][i])
+                        pts3d_list.append(pred["pts3d_in_other_view"][i])
+
+                pred["conf"] = conf_list
+                pred["pts3d_in_other_view"] = pts3d_list
+
+        batch_size = len(preds[0]["pts3d_in_other_view"])  # Get the batch size
+
+        # Prepare data_for_processing
+        data_for_processing = []
+
+        for i in range(batch_size):
+            # Collect preds for each sample in the batch
+            sample_preds = [{key: value[i].cpu() for key, value in view.items()} for view in preds]
+
+            data_for_processing.append(sample_preds)
+
+        # Estimate the focal length
+        def estimate_focal_for_sample(sample_preds):
+            if estimate_focal_from_first_view:
+                # Get the first view's pts3d and confidence map
+                pts3d_i = sample_preds[0]["pts3d_in_other_view"].unsqueeze(0)  # Shape: (1, H, W, 3)
+                conf_i = sample_preds[0]["conf"].unsqueeze(0)                  # Shape: (1, H, W)
+
+                # Estimate focal length using the provided function and confidence mask
+                estimated_focal = estimate_focal(pts3d_i, conf_i, min_conf_thr_percentile=90)
+
+                # Store the estimated focal length in sample_preds
+                for view_pred in sample_preds:
+                    view_pred["focal_length"] = estimated_focal
+
+            return sample_preds
+
+        with ThreadPoolExecutor() as executor:
+            data_for_processing = list(executor.map(estimate_focal_for_sample, data_for_processing))
+
+        # Estimate the camera poses
+        # Use ProcessPoolExecutor to parallelize processing across samples in the batch
+        poses_c2w_all = []
+        estimated_focals_all = []
+
+        # Use partial to fix arguments
+        from functools import partial
+
+        estimate_cam_pose_one_sample_partial = partial(estimate_cam_pose_one_sample, device=device, niter_PnP=niter_PnP)
+
+        with ThreadPoolExecutor() as executor:
+            results = list(executor.map(estimate_cam_pose_one_sample_partial, data_for_processing))
+
+        # Collect results from all processed samples
+        for poses_c2w_sample, estimated_focals_sample in results:
+            poses_c2w_all.append(poses_c2w_sample)
+            estimated_focals_all.append(estimated_focals_sample)
+
+        return poses_c2w_all, estimated_focals_all
 
     def configure_optimizers(self) -> Dict[str, Any]:
         optimizer = self.hparams.optimizer(params=self.trainer.model.parameters())
@@ -272,3 +439,75 @@ class MultiViewDUSt3RLitModule(LightningModule):
                 new_ckpt['model'][key] = value
 
         return new_ckpt
+
+
+def estimate_cam_pose_one_sample(sample_preds, device='cpu', niter_PnP=10):
+    poses_c2w = []
+    estimated_focals = []
+
+    # Define the function to process each view
+    def process_view(view_idx):
+        pts3d = sample_preds[view_idx]["pts3d_in_other_view"].cpu().numpy().squeeze()  # (H, W, 3)
+        valid_mask = sample_preds[view_idx]["conf"].cpu().numpy().squeeze() > 0.2  # Confidence mask
+        focal_length = float(sample_preds[view_idx]["focal_length"]) if "focal_length" in sample_preds[view_idx] else None
+
+        # Call fast_pnp with unflattened pts3d and mask
+        focal_length, pose_c2w = fast_pnp(
+            torch.tensor(pts3d),
+            focal_length,  # Guess focal length
+            torch.tensor(valid_mask, dtype=torch.bool),
+            device,
+            pp=None,  # Use default principal point (center of image)
+            niter_PnP=niter_PnP
+        )
+
+        if pose_c2w is None or focal_length is None:
+            print(f"Failed to estimate pose for view {view_idx}")
+            return np.eye(4), focal_length  # Return identity pose in case of failure
+
+        # Return the results for this view
+        return pose_c2w.cpu().numpy(), focal_length
+
+    # Use ThreadPoolExecutor to process views in parallel
+    with ThreadPoolExecutor() as executor:
+        # Map the process_view function to each view index
+        results = list(executor.map(process_view, range(len(sample_preds))))
+
+    # Collect the results
+    for pose_c2w_result, focal_length_result in results:
+        poses_c2w.append(pose_c2w_result)
+        estimated_focals.append(focal_length_result)
+
+    return poses_c2w, estimated_focals
+
+
+def estimate_focal(pts3d_i, conf_i, pp=None, min_conf_thr_percentile=50):
+    B, H, W, THREE = pts3d_i.shape
+    assert B == 1  # Since we're processing one sample at a time
+
+    if pp is None:
+        pp = torch.tensor((W / 2, H / 2), device=pts3d_i.device).view(1, 2)  # Shape: (1, 2)
+
+    # Flatten the confidence map using reshape instead of view
+    conf_flat = conf_i.reshape(-1)
+
+    # Compute the confidence threshold based on the percentile
+    percentile = min_conf_thr_percentile / 100.0  # Convert to a fraction
+    conf_threshold = torch.quantile(conf_flat, percentile)
+
+    # Create the confidence mask based on the computed threshold
+    conf_mask = conf_i >= conf_threshold
+    conf_mask = conf_mask.view(B, H, W)  # Ensure shape is (B, H, W)
+
+    # Check if there are enough valid points
+    if conf_mask.sum() < 10:  # Adjust the minimum number as needed
+        print("Not enough high-confidence points for focal estimation.")
+        # Optionally, adjust the percentile or set conf_mask to all True
+        # For example:
+        # conf_mask = torch.ones_like(conf_mask, dtype=torch.bool)
+
+    focal = estimate_focal_knowing_depth_and_confidence_mask(
+        pts3d_i, pp.unsqueeze(0), conf_mask, focal_mode="weiszfeld"
+    ).ravel()
+    return float(focal)
+
