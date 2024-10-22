@@ -18,6 +18,7 @@ data_module:
     - 100 @ ARKitScenes_Multiview(split='train', num_views=${data.num_views_val}, num_samples_per_window=10, ROOT='${data.data_root}/arkitscenes_processed', resolution=(512, 384), seed=777)
     - 100 @ Habitat_Multiview(100_000, split='val', num_views=${data.num_views_val}, ROOT='${data.data_root}/habitat_processed', resolution=(512,384), seed=777)
   batch_size_per_device: 6
+  batch_size_per_device_val: 4
   num_workers: 6
   pin_memory: True
 

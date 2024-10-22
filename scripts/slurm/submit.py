@@ -37,7 +37,7 @@ def main():
 #SBATCH --mail-user=jianingy@meta.com
 #SBATCH --mail-type=BEGIN,END
 #SBATCH --account=cortex
-#SBATCH --qos=cortex
+#SBATCH --qos=cortex_high
 #SBATCH --nodes={nodes}
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96

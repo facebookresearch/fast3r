@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+import re
 import torch
 from lightning import LightningModule
 from lightning.pytorch.loggers.wandb import WandbLogger
@@ -144,7 +145,11 @@ class MultiViewDUSt3RLitModule(LightningModule):
         # log the details of the loss
         if loss_details is not None:
             for key, value in loss_details.items():
-                self.log(f"train_detail/{key}", value, on_step=True, on_epoch=False, prog_bar=False)
+                self.log(f"train_detail_{key}", value, on_step=True, on_epoch=False, prog_bar=False)
+                match = re.search(r'/(\d{1,2})$', key)
+                if match:
+                    stripped_key = key[:match.start()]
+                    self.log(f"train/{stripped_key}", value, on_step=True, on_epoch=False, prog_bar=False)
 
         # Log the total number of samples seen so far
         batch_size = views[0]["img"].shape[0]
@@ -171,13 +176,13 @@ class MultiViewDUSt3RLitModule(LightningModule):
         # Log the overall validation loss
         # self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=True, batch_size=batch_size)
         self.val_loss(loss)
-        self.log(f"val/loss_{dataset_name}", loss, on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+        # self.log(f"val/loss_{dataset_name}", loss, on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
 
         # Log the details of the loss with dataset name and view number in the key
         if loss_details is not None:
             for key, value in loss_details.items():
                 self.log(
-                    f"val_detail/{dataset_name}_view_{key}",
+                    f"val_detail_{dataset_name}_{key}",
                     value,
                     on_step=False,
                     on_epoch=True,
@@ -187,6 +192,10 @@ class MultiViewDUSt3RLitModule(LightningModule):
                     add_dataloader_idx=False,
                     batch_size=batch_size,
                 )
+                match = re.search(r'/(\d{1,2})$', key)
+                if match:
+                    stripped_key = key[:match.start()]
+                    self.log(f"val/{dataset_name}_{stripped_key}", value, on_step=False, on_epoch=True, prog_bar=False, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
 
         # Evaluate metrics for camera poses
         if dataset_name == "Co3d_v2":
@@ -219,7 +228,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
         # Convert poses to tensors
         device = self.device
-        pred_cameras = torch.tensor(np.stack(poses_c2w_estimated), device=device)  # Shape (B, num_views, 4, 4)
+        pred_cameras = torch.tensor(np.stack(poses_c2w_estimated), dtype=poses_c2w_gt[0].dtype, device=device)  # Shape (B, num_views, 4, 4)
         gt_cameras = torch.stack(poses_c2w_gt).transpose(0, 1)  # (B, num_views, 4, 4)
 
         # compute the metrics: RRA, RTA, mAA
@@ -227,10 +236,6 @@ class MultiViewDUSt3RLitModule(LightningModule):
         if pred_cameras.shape[1] >= 2:
 
             def process_sample(sample_idx):
-                my_preds = preds
-                my_views = views
-
-                # Extract camera poses for the current sample
                 pred_sample = pred_cameras[sample_idx]  # Shape (num_views, 4, 4)
                 gt_sample = gt_cameras[sample_idx]      # Shape (num_views, 4, 4)
 
@@ -257,12 +262,12 @@ class MultiViewDUSt3RLitModule(LightningModule):
             for results in batch_results:
                 for tau in self.RRA_thresholds:
                     getattr(self, f'val_RRA_{tau}')(results[f"RRA_at_{tau}"])
-                    self.log(f"val/RRA_at_{tau}", getattr(self, f'val_RRA_{tau}'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+                    self.log(f"val_metric/RRA_at_{tau}", getattr(self, f'val_RRA_{tau}'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
                 for tau in self.RTA_thresholds:
                     getattr(self, f'val_RTA_{tau}')(results[f"RTA_at_{tau}"])
-                    self.log(f"val/RTA_at_{tau}", getattr(self, f'val_RTA_{tau}'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+                    self.log(f"val_metric/RTA_at_{tau}", getattr(self, f'val_RTA_{tau}'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
                 self.val_mAA(results['mAA_30'])
-                self.log("val/mAA_30", self.val_mAA, on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+                self.log("val_metric/mAA_30", self.val_mAA, on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
 
         else:
             log.warning("Not enough camera poses to compute relative errors.")
@@ -462,7 +467,7 @@ def estimate_cam_pose_one_sample(sample_preds, device='cpu', niter_PnP=10):
         )
 
         if pose_c2w is None or focal_length is None:
-            print(f"Failed to estimate pose for view {view_idx}")
+            log.warning(f"Failed to estimate pose for view {view_idx}")
             return np.eye(4), focal_length  # Return identity pose in case of failure
 
         # Return the results for this view
@@ -510,4 +515,3 @@ def estimate_focal(pts3d_i, conf_i, pp=None, min_conf_thr_percentile=50):
         pts3d_i, pp.unsqueeze(0), conf_mask, focal_mode="weiszfeld"
     ).ravel()
     return float(focal)
-

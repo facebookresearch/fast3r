@@ -83,14 +83,31 @@ class Fast3R(nn.Module,
         self.head_type = head_args['head_type']
         self.depth_mode = head_args['depth_mode']
         self.conf_mode = head_args['conf_mode']
-        # allocate head
+
+        # allocate primary downstream head
         self.downstream_head = self.head_factory(
             head_args['head_type'], head_args['output_mode'], has_conf=bool(head_args['conf_mode']), patch_size=head_args['patch_size']
         )
+
+        # add the second head if with_local_head is True
+        if head_args.get('with_local_head', False):
+            self.downstream_head_local = self.head_factory(
+                head_args['head_type'], head_args['output_mode'], has_conf=bool(head_args['conf_mode']), patch_size=head_args['patch_size']
+            )
+        else:
+            self.downstream_head_local = None
+
         # magic wrapper
         self.head = transpose_to_landscape(
             self.downstream_head, activate=head_args['landscape_only']
         )
+
+        if self.downstream_head_local:
+            self.local_head = transpose_to_landscape(
+                self.downstream_head_local, activate=head_args['landscape_only']
+            )
+        else:
+            self.local_head = None
 
     def head_factory(self, head_type, output_mode, has_conf=False, patch_size=16):
         """ " build a prediction head for the decoder"""
@@ -289,18 +306,30 @@ class Fast3R(nn.Module,
                 final_results = [{} for _ in range(num_images)]
                 for img_id in range(num_images):
                     img_result = self.head(gathered_outputs_list[img_id], shapes[img_id])
+                    if self.local_head:
+                        local_img_result = self.local_head(gathered_outputs_list[img_id], shapes[img_id])
+
                     # Re-map the results back to the original batch and image order
                     for key in img_result.keys():
                         if key == 'pts3d':
                             final_results[img_id]['pts3d_in_other_view'] = img_result[key]
                         else:
                             final_results[img_id][key] = img_result[key]
+
+                    # Store local head output if available
+                    if self.local_head:
+                        final_results[img_id]['pts3d_local'] = local_img_result['pts3d']
+                        if 'conf' in local_img_result:
+                            final_results[img_id]['conf_local'] = local_img_result['conf']
             else:
                 # Concatenate shapes
                 concatenated_shapes = torch.cat(shapes, dim=0)
 
                 # Forward pass through self.head()
                 result = self.head(gathered_outputs_list, concatenated_shapes)
+
+                if self.local_head:
+                    local_result = self.local_head(gathered_outputs_list, concatenated_shapes)
 
                 # Initialize the final results list
                 final_results = [{} for _ in range(num_images)]
@@ -313,6 +342,13 @@ class Fast3R(nn.Module,
                             final_results[img_id]['pts3d_in_other_view'] = img_result
                         else:
                             final_results[img_id][key] = img_result
+
+                        # Store local head output if available
+                        if self.local_head:
+                            local_img_result = local_result['pts3d'][img_id * B:(img_id + 1) * B]
+                            final_results[img_id]['pts3d_local'] = local_img_result
+                            if 'conf' in local_result:
+                                final_results[img_id]['conf_local'] = local_result['conf'][img_id * B:(img_id + 1) * B]
 
         return final_results
 

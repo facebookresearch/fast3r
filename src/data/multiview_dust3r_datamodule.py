@@ -3,8 +3,8 @@ from typing import Any, Dict, Optional
 from lightning import LightningDataModule
 from lightning.pytorch.utilities.combined_loader import CombinedLoader
 from torch.utils.data import DataLoader, Dataset, random_split
-from dust3r.datasets import get_data_loader
-from dust3r.datasets import *
+from src.dust3r.datasets import get_data_loader
+from src.dust3r.datasets import *
 
 class MultiViewDUSt3RDataModule(LightningDataModule):
     """LightningDataModule for the custom dataset.
@@ -43,6 +43,7 @@ class MultiViewDUSt3RDataModule(LightningDataModule):
         train_datasets: list[str],
         validation_datasets: list[str],
         batch_size_per_device: int = 64,
+        batch_size_per_device_val: int = 64,
         num_workers: int = 12,
         pin_memory: bool = True,
     ) -> None:
@@ -59,6 +60,7 @@ class MultiViewDUSt3RDataModule(LightningDataModule):
         self.train_datasets = train_datasets
         self.validation_datasets = validation_datasets
         self.batch_size_per_device = batch_size_per_device
+        self.batch_size_per_device_val = batch_size_per_device_val
         self.num_workers = num_workers
         self.pin_memory = pin_memory
 
@@ -124,7 +126,7 @@ class MultiViewDUSt3RDataModule(LightningDataModule):
         val_loaders = [
             get_data_loader(
                 dataset,
-                batch_size=self.batch_size_per_device,
+                batch_size=self.batch_size_per_device_val,
                 num_workers=self.num_workers,
                 pin_mem=self.pin_memory,
                 shuffle=False,

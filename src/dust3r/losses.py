@@ -20,7 +20,11 @@ from dust3r.utils.geometry import (
 
 
 def Sum(*losses_and_masks):
-    loss, mask = losses_and_masks[0]
+    if len(losses_and_masks[0]) == 2:
+        loss, mask = losses_and_masks[0]
+    else:
+        loss, mask, loss_type = losses_and_masks[0]
+
     if loss.ndim > 0:
         # we are actually returning the loss for every pixels
         return losses_and_masks
@@ -391,6 +395,173 @@ class Regr3DMultiviewV2(Criterion, MultiLoss):
         return Sum(*total_loss), details
 
 
+class Regr3DMultiviewV3(Criterion, MultiLoss):
+    """Ensure that all 3D points are correct for multiple views.
+    The point clouds from all views are concatenated together for normalization,
+    but loss is calculated separately for each view.
+    This version supports an additional local head for local coordinate systems.
+    """
+
+    def __init__(self, criterion, norm_mode="avg_dis", gt_scale=False):
+        super().__init__(criterion)
+        self.norm_mode = norm_mode
+        self.gt_scale = gt_scale
+
+    def get_pts3d_from_views(self, gt_views, pred_views, dist_clip=None, local=False):
+        """Get point clouds and valid masks for multiple views."""
+        gt_pts_list = []
+        pr_pts_list = []
+        valid_mask_list = []
+
+        if not local:  # compute the inverse transformation for the anchor view (first view)
+            inv_matrix_anchor = inv(gt_views[0]["camera_pose"].float())
+
+        for gt_view, pred_view in zip(gt_views, pred_views):
+            if local:
+                # Rotate GT points to align with the local camera origin for supervision
+                inv_matrix_local = inv(gt_view["camera_pose"].float())
+                gt_pts = geotrf(inv_matrix_local, gt_view["pts3d"])  # Transform GT points to local view's origin
+                pr_pts = pred_view.get("pts3d_local")  # Local predicted points
+            else:
+                # Use the anchor view (first view) transformation for global loss
+                gt_pts = geotrf(inv_matrix_anchor, gt_view["pts3d"])  # Transform GT points to anchor view
+                pr_pts = pred_view.get("pts3d_in_other_view")  # Predicted points in anchor view
+
+            valid_gt = gt_view["valid_mask"].clone()
+
+            if dist_clip is not None:
+                dis = gt_pts.norm(dim=-1)
+                valid_gt &= dis <= dist_clip
+
+            gt_pts_list.append(gt_pts)
+            pr_pts_list.append(pr_pts)
+            valid_mask_list.append(valid_gt)
+
+        return gt_pts_list, pr_pts_list, valid_mask_list
+
+    def normalize_pointcloud_from_views(self, pts_list, norm_mode="avg_dis", valid_list=None):
+        """Normalize point clouds from multiple views, excluding invalid points from normalization."""
+        assert all(pts.ndim >= 3 and pts.shape[-1] == 3 for pts in pts_list)
+
+        norm_mode, dis_mode = norm_mode.split("_")
+
+        # Concatenate all point clouds and valid masks if provided
+        all_pts = torch.cat(pts_list, dim=1)
+        if valid_list is not None:
+            all_valid = torch.cat(valid_list, dim=1)
+            valid_pts = all_pts[all_valid]  # Keep only valid points for norm calculation
+        else:
+            valid_pts = all_pts
+
+        # Compute the distance to the origin for valid points
+        dis = valid_pts.norm(dim=-1)
+
+        # Apply distance transformation based on dis_mode
+        if dis_mode == "dis":
+            pass  # Do nothing
+        elif dis_mode == "log1p":
+            dis = torch.log1p(dis)
+        elif dis_mode == "warp-log1p":
+            log_dis = torch.log1p(dis)
+            warp_factor = log_dis / dis.clip(min=1e-8)
+            all_pts = all_pts * warp_factor.view(-1, 1)  # Warp the points with the warp factor
+            dis = log_dis  # The final distance is now the log-transformed distance
+        else:
+            raise ValueError(f"Unsupported distance mode: {dis_mode}")
+
+        # Apply different normalization modes
+        if norm_mode == "avg":
+            norm_factor = dis.mean()  # Compute mean distance of valid points
+        elif norm_mode == "median":
+            norm_factor = dis.median()  # Compute median distance of valid points
+        else:
+            raise ValueError(f"Unsupported normalization mode: {norm_mode}")
+
+        norm_factor = norm_factor.clip(min=1e-8)  # Prevent division by zero
+
+        # Normalize all point clouds
+        normalized_pts = [torch.where(valid.unsqueeze(-1), pts / norm_factor, pts)
+                          for pts, valid in zip(pts_list, valid_list)]
+
+        return normalized_pts
+
+    def normalize_pointcloud_per_view(self, pts_list, norm_mode="avg_dis", valid_list=None):
+        """Normalize point clouds on a per-view basis."""
+        norm_mode, dis_mode = norm_mode.split("_")
+
+        normed_pts_list = []
+        for pts, valid in zip(pts_list, valid_list):
+            if valid is not None:
+                valid_pts = pts[valid]
+            else:
+                valid_pts = pts
+
+            dis = valid_pts.norm(dim=-1)
+
+            # Apply distance transformation based on dis_mode
+            if dis_mode == "dis":
+                pass  # Do nothing
+            elif dis_mode == "log1p":
+                dis = torch.log1p(dis)
+            elif dis_mode == "warp-log1p":
+                log_dis = torch.log1p(dis)
+                warp_factor = log_dis / dis.clip(min=1e-8)
+                pts = pts * warp_factor.view(-1, 1)  # Warp the points with the warp factor
+                dis = log_dis  # The final distance is now the log-transformed distance
+            else:
+                raise ValueError(f"Unsupported distance mode: {dis_mode}")
+
+            if norm_mode == "avg":
+                norm_factor = dis.mean()  # Per-view normalization
+            elif norm_mode == "median":
+                norm_factor = dis.median()
+            else:
+                raise ValueError(f"Unsupported normalization mode: {norm_mode}")
+
+            norm_factor = norm_factor.clip(min=1e-8)  # Avoid division by zero
+
+            normed_pts_list.append(torch.where(valid.unsqueeze(-1), pts / norm_factor, pts))
+
+        return normed_pts_list
+
+    def compute_loss(self, gts, preds, **kw):
+        total_loss = []
+        details = {}
+        self_name = "Regr3DMultiviewV3"
+
+        # Compute loss for pts3d_in_other_view (global loss)
+        gt_pts_list, pr_pts_list, valid_mask_list = self.get_pts3d_from_views(gts, preds, **kw)
+
+        if self.norm_mode:
+            pr_pts_list = self.normalize_pointcloud_from_views(pr_pts_list, self.norm_mode, valid_mask_list)
+            if not self.gt_scale:
+                gt_pts_list = self.normalize_pointcloud_from_views(gt_pts_list, self.norm_mode, valid_mask_list)
+
+        # Compute loss for each view in global coordinate system
+        for i, (gt_pts, pr_pts, valid_mask) in enumerate(zip(gt_pts_list, pr_pts_list, valid_mask_list)):
+            loss = self.criterion(pr_pts[valid_mask], gt_pts[valid_mask])
+            total_loss.append((loss, valid_mask, "global"))
+            details[self_name + f"_pts3d_loss_global/{i:02d}"] = float(loss.mean())
+
+        # Check if local loss is needed (i.e., `pts3d_local` and `conf_local` exist in preds)
+        if "pts3d_local" in preds[0]:
+            # Compute loss for pts3d_local (local loss)
+            gt_pts_list_local, pr_pts_list_local, valid_mask_list_local = self.get_pts3d_from_views(gts, preds, local=True, **kw)
+
+            # Normalize per-view for local coordinate system
+            pr_pts_list_local = self.normalize_pointcloud_per_view(pr_pts_list_local, self.norm_mode, valid_mask_list_local)
+            if not self.gt_scale:
+                gt_pts_list_local = self.normalize_pointcloud_per_view(gt_pts_list_local, self.norm_mode, valid_mask_list_local)
+
+            # Compute loss for each view in its local coordinate system
+            for i, (gt_pts, pr_pts, valid_mask) in enumerate(zip(gt_pts_list_local, pr_pts_list_local, valid_mask_list_local)):
+                loss_local = self.criterion(pr_pts[valid_mask], gt_pts[valid_mask])
+                total_loss.append((loss_local, valid_mask, "local"))
+                details[self_name + f"_pts3d_loss_local/{i:02d}"] = float(loss_local.mean())
+
+        return Sum(*total_loss), details
+
+
 class ConfLossMultiview(MultiLoss):
     """Weighted regression by learned confidence for multiple views.
     Assuming the input pixel_loss is a pixel-level regression loss.
@@ -435,6 +606,67 @@ class ConfLossMultiview(MultiLoss):
         details.update(conf_details)
         return total_conf_loss, details
 
+
+class ConfLossMultiviewV2(MultiLoss):
+    """Weighted regression by learned confidence for multiple views.
+    This version normalizes the total confidence loss by the number of global and local losses separately.
+    """
+
+    def __init__(self, pixel_loss, alpha=1):
+        super().__init__()
+        assert alpha > 0
+        self.alpha = alpha
+        self.pixel_loss = pixel_loss.with_reduction("none")
+
+    def get_name(self):
+        return f"ConfLossMultiviewV2({self.pixel_loss})"
+
+    def get_conf_log(self, x):
+        return x, torch.log(x)
+
+    def compute_loss(self, gts, preds, **kw):
+        # compute per-pixel loss for all views
+        total_loss, details = self.pixel_loss(gts, preds, **kw)
+
+        total_conf_loss = 0
+        conf_details = {}
+        self_name = type(self).__name__
+
+        # Separate counters for global and local losses
+        global_count = 0
+        local_count = 0
+
+        for loss, mask, loss_type in total_loss:
+            if loss_type == "global":
+                conf_key = "conf"
+                conf, log_conf = self.get_conf_log(preds[global_count][conf_key][mask])
+                conf_loss = loss * conf - self.alpha * log_conf
+                conf_loss = conf_loss.mean() if conf_loss.numel() > 0 else 0
+
+                conf_details[self_name + f"_conf_loss_global/{global_count:02d}"] = float(conf_loss)
+
+                global_count += 1
+
+            elif loss_type == "local":
+                conf_key = "conf_local"
+                conf, log_conf = self.get_conf_log(preds[local_count][conf_key][mask])
+                conf_loss = loss * conf - self.alpha * log_conf
+                conf_loss = conf_loss.mean() if conf_loss.numel() > 0 else 0
+
+                conf_details[self_name + f"_conf_loss_local/{local_count:02d}"] = float(conf_loss)
+
+                local_count += 1
+
+            total_conf_loss += conf_loss
+
+        if local_count > 0:
+            assert local_count == global_count, "Mismatch between the number of local and global losses."
+
+        # Normalize total_conf_loss by the number of global and local losses separately
+        total_conf_loss /= (global_count + local_count)
+
+        details.update(conf_details)
+        return total_conf_loss, details
 
 class ConfLoss(MultiLoss):
     """Weighted regression by learned confidence.
