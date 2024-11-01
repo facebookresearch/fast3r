@@ -32,6 +32,9 @@ class EasyDataset:
     def set_epoch(self, epoch):
         pass  # nothing to do by default
 
+    def set_ratio(self, train_ratio):
+        pass
+
     def make_sampler(
         self, batch_size, shuffle=True, world_size=1, rank=0, drop_last=True
     ):
@@ -111,6 +114,9 @@ class ResizedDataset(EasyDataset):
 
         assert len(self._idxs_mapping) == self.new_size
 
+    def set_ratio(self, train_ratio):
+        self.dataset.train_ratio = train_ratio
+
     def __getitem__(self, idx):
         assert hasattr(
             self, "_idxs_mapping"
@@ -151,6 +157,10 @@ class CatDataset(EasyDataset):
     def set_epoch(self, epoch):
         for dataset in self.datasets:
             dataset.set_epoch(epoch)
+
+    def set_ratio(self, train_ratio):
+        for dataset in self.datasets:
+            dataset.set_ratio(train_ratio)
 
     def __getitem__(self, idx):
         other = None

@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import re
+import roma
 import torch
 from lightning import LightningModule
 from lightning.pytorch.loggers.wandb import WandbLogger
@@ -11,7 +12,10 @@ from src.dust3r.model import FlashDUSt3R
 from src.models.fast3r import Fast3R
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from src.eval.cam_pose_metric import camera_to_rel_deg, calculate_auc
+from src.eval.recon_metric import accuracy, accuracy_fast, completion, completion_fast
 from src.dust3r.cloud_opt.init_im_poses import fast_pnp
+import open3d as o3d
+import time
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -19,7 +23,7 @@ from src.utils import pylogger
 
 log = pylogger.RankedLogger(__name__, rank_zero_only=True)
 
-class AccululatedSum(BaseAggregator):
+class AccumulatedSum(BaseAggregator):
     def __init__(
         self,
         **kwargs: Any,
@@ -61,10 +65,14 @@ class MultiViewDUSt3RLitModule(LightningModule):
         self.pretrained = pretrained
         self.resume_from_checkpoint = resume_from_checkpoint
 
-        # for averaging loss across batches
-        self.epoch_fraction = 0.0  # these are identical across all GPUs, so just use plain variable
-        self.train_total_samples = AccululatedSum()  # these need to be reduced across GPUs, so use Metric
-        self.train_total_images = AccululatedSum()  # these need to be reduced across GPUs, so use Metric
+        # use register_buffer to save these with checkpoints
+        # so that when we resume training, these bookkeeping variables are preserved
+        self.register_buffer("epoch_fraction", torch.tensor(0.0, dtype=torch.float32, device=self.device))
+        self.register_buffer("train_total_samples", torch.tensor(0, dtype=torch.long, device=self.device))
+        self.register_buffer("train_total_images", torch.tensor(0, dtype=torch.long, device=self.device))
+
+        self.train_total_samples_per_step = AccumulatedSum()  # these need to be reduced across GPUs, so use Metric
+        self.train_total_images_per_step = AccumulatedSum()  # these need to be reduced across GPUs, so use Metric
 
         self.val_loss = MeanMetric()
 
@@ -79,8 +87,29 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
         self.val_mAA = MeanMetric()
 
+        # Reconstruction evaluation metrics
+        for dataset_name in ['dtu', '7scenes', 'nrgbd']:
+            setattr(self, f'val_recon_{dataset_name}_accuracy', MeanMetric())
+            setattr(self, f'val_recon_{dataset_name}_accuracy_median', MeanMetric())
+            setattr(self, f'val_recon_{dataset_name}_completion', MeanMetric())
+            setattr(self, f'val_recon_{dataset_name}_completion_median', MeanMetric())
+            setattr(self, f'val_recon_{dataset_name}_nc1', MeanMetric())
+            setattr(self, f'val_recon_{dataset_name}_nc1_median', MeanMetric())
+            setattr(self, f'val_recon_{dataset_name}_nc2', MeanMetric())
+            setattr(self, f'val_recon_{dataset_name}_nc2_median', MeanMetric())
+
     def forward(self, views: List[Dict[str, torch.Tensor]]) -> Any:
         return self.net(views)
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        # Legacy: if the checkpoint does not contain the epoch_fraction, train_total_samples, and train_total_images
+        # we manually add them to the checkpoint
+        if checkpoint["state_dict"].get("epoch_fraction") is None:
+            checkpoint["state_dict"]["epoch_fraction"] = self.epoch_fraction
+        if checkpoint["state_dict"].get("train_total_samples") is None:
+            checkpoint["state_dict"]["train_total_samples"] = self.train_total_samples
+        if checkpoint["state_dict"].get("train_total_images") is None:
+            checkpoint["state_dict"]["train_total_images"] = self.train_total_images
 
     def on_train_start(self) -> None:
         """Lightning hook that is called when training begins."""
@@ -136,7 +165,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
         self, batch: List[Dict[str, torch.Tensor]], batch_idx: int
     ) -> torch.Tensor:
         views, preds, loss, loss_details = self.model_step(batch, self.train_criterion)
-        self.epoch_fraction = self.trainer.current_epoch + batch_idx / self.trainer.num_training_batches
+        self.epoch_fraction = torch.tensor(self.trainer.current_epoch + batch_idx / self.trainer.num_training_batches, device=self.device)
 
         self.log("trainer/epoch", self.epoch_fraction, on_step=True, on_epoch=False, prog_bar=True)
         self.log("trainer/lr", self.trainer.lr_scheduler_configs[0].scheduler.get_last_lr()[0], on_step=True, on_epoch=False, prog_bar=True)
@@ -153,14 +182,18 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
         # Log the total number of samples seen so far
         batch_size = views[0]["img"].shape[0]
-        self.train_total_samples(batch_size)
-        self.log("trainer/total_samples", self.train_total_samples.compute(), on_step=True, on_epoch=False, prog_bar=False)
+        self.train_total_samples_per_step(batch_size)  # aggregate across all GPUs
+        self.train_total_samples += self.train_total_samples_per_step.compute()  # accumulate across all steps
+        self.train_total_samples_per_step.reset()
+        self.log("trainer/total_samples", self.train_total_samples, on_step=True, on_epoch=False, prog_bar=False)
 
         # Log the total number of images seen so far
         num_views = len(views)
         n_image_cur_step = batch_size * num_views
-        self.train_total_images(n_image_cur_step)
-        self.log("trainer/total_images", self.train_total_images.compute(), on_step=True, on_epoch=False, prog_bar=False)
+        self.train_total_images_per_step(n_image_cur_step)  # aggregate across all GPUs
+        self.train_total_images += self.train_total_images_per_step.compute()  # accumulate across all steps
+        self.train_total_images_per_step.reset()
+        self.log("trainer/total_images", self.train_total_images, on_step=True, on_epoch=False, prog_bar=False)
 
         return loss
 
@@ -197,31 +230,263 @@ class MultiViewDUSt3RLitModule(LightningModule):
                     stripped_key = key[:match.start()]
                     self.log(f"val/{dataset_name}_{stripped_key}", value, on_step=False, on_epoch=True, prog_bar=False, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
 
+        loss_value = loss.detach().cpu().item()
+        del loss, loss_details
+        torch.cuda.empty_cache()
+
         # Evaluate metrics for camera poses
         if dataset_name == "Co3d_v2":
             self.evaluate_camera_poses(views, preds, estimate_focal_from_first_view=True)
 
-        return loss
+        # Evaluate point clouds only for the reconstruction datasets (DTU, 7-Scenes, and NRGBD)
+        # eval only every 5 epochs because it's slow
+        if dataset_name in ['dtu', '7scenes', 'nrgbd'] and (self.current_epoch % 5 == 4 or self.current_epoch == 0):
+            self.evaluate_reconstruction(views, preds, dataset_name=dataset_name)
+
+        del views, preds
+        torch.cuda.empty_cache()
+
+        return loss_value
 
     def on_validation_epoch_end(self) -> None:
         self.log("val/loss", self.val_loss, prog_bar=True)
 
         # if we dont do these, wandb for some reason cannot display the validation loss with them as the x-axis
         self.log("trainer/epoch", self.epoch_fraction)
-        self.log("trainer/total_samples", self.train_total_samples.compute())
-        self.log("trainer/total_images", self.train_total_images.compute())
+        self.log("trainer/total_samples", self.train_total_samples)
+        self.log("trainer/total_images", self.train_total_images)
 
     # def test_step(
     #     self, batch: List[Dict[str, torch.Tensor]], batch_idx: int
     # ) -> None:
     #     pass
 
+    def evaluate_reconstruction(self, views, preds, dataset_name, min_conf_thr_percentile=60):
+        # Correct orientation of the predicted points and confidence maps if necessary
+        # self.correct_preds_orientation(preds, views)
+
+        batch_size = len(views[0]['img'])  # Assuming batch_size is consistent
+
+        # Initialize lists to collect per-sample metrics
+        acc_list = []
+        acc_med_list = []
+        comp_list = []
+        comp_med_list = []
+        nc1_list = []
+        nc1_med_list = []
+        nc2_list = []
+        nc2_med_list = []
+
+        # Define the function to process a single sample
+        def process_sample(i):
+            pred_pts_list = []
+            gt_pts_list_icp = []
+            gt_pts_list_metrics = []
+            colors_pred_list = []
+            colors_gt_list = []
+            conf_list = []
+            weights_list = []
+
+            for j, (view, pred) in enumerate(zip(views, preds)):
+                # Extract predicted points and confidence
+                pts_pred = pred['pts3d_in_other_view'][i]  # Shape: (H, W, 3)
+                conf = pred['conf'][i]  # Shape: (H, W)
+
+                ########### Debug: use GT point map to estimate poses
+                # pts_gt = view['pts3d'][i]  # Shape: (H, W, 3)
+                ########### End Debug
+
+                # Extract GT points
+                pts_gt = view['pts3d'][i]  # Shape: (H, W, 3)
+                valid_mask = view['valid_mask'][i]  # Shape: (H, W)
+
+                # Compute the confidence threshold for this view
+                conf_flat = conf.view(-1)
+                conf_threshold_value = torch.quantile(conf_flat, min_conf_thr_percentile / 100.0)
+
+                # Create masks
+                conf_mask = conf >= conf_threshold_value  # Shape: (H, W)
+                final_mask_pred = valid_mask & conf_mask  # Predicted points: valid and high confidence
+                final_mask_gt_icp = final_mask_pred       # GT points for ICP: same positions as high-confidence predicted points
+                final_mask_gt_metrics = valid_mask        # GT points for metrics: all valid points
+
+                # Apply masks to predicted points and conf
+                pts_pred_masked = pts_pred[final_mask_pred]      # High-confidence predicted points
+                conf_masked = conf[final_mask_pred]              # Corresponding confidence values
+
+                # Apply mask to GT points for ICP
+                pts_gt_masked_icp = pts_gt[final_mask_gt_icp]    # GT points corresponding to high-confidence predicted points
+
+                # Apply mask to GT points for metrics
+                pts_gt_masked_metrics = pts_gt[final_mask_gt_metrics]  # All valid GT points in this view
+                gt_pts_list_metrics.append(pts_gt_masked_metrics)
+
+                # Get image for colors
+                img = view['img'][i]  # Shape: (3, H, W)
+                img = img.permute(1, 2, 0)  # Shape: (H, W, 3)
+                img = (img + 1.0) / 2.0  # Convert from [-1, 1] to [0, 1]
+                colors_pred_masked = img[final_mask_pred]  # Colors at high-confidence predicted points
+                colors_gt_masked = img[final_mask_gt_metrics]  # Colors at all valid GT points
+
+                # Weights for ICP alignment (all ones since we've already filtered low-confidence points)
+                weights_masked = torch.ones_like(conf_masked, dtype=torch.float32)
+
+                # Append to lists
+                pred_pts_list.append(pts_pred_masked)
+                gt_pts_list_icp.append(pts_gt_masked_icp)
+                conf_list.append(conf_masked)
+                colors_pred_list.append(colors_pred_masked)
+                colors_gt_list.append(colors_gt_masked)
+                weights_list.append(weights_masked)
+
+            # Concatenate points, colors, confidences, and weights
+            if len(pred_pts_list) == 0 or len(gt_pts_list_metrics) == 0:
+                # If no valid points, return default metrics
+                print(f"Sample {i}: No valid points found.")
+                return 0, 0, 0, 0, 0, 0, 0, 0
+
+            pred_pts_all = torch.cat(pred_pts_list, dim=0)           # Shape: (N_pred, 3)
+            gt_pts_all_icp = torch.cat(gt_pts_list_icp, dim=0)       # Shape: (N_pred, 3)
+            gt_pts_all_metrics = torch.cat(gt_pts_list_metrics, dim=0)  # Shape: (N_gt, 3)
+            colors_pred_all = torch.cat(colors_pred_list, dim=0)               # Shape: (N_pred, 3)
+            colors_gt_all = torch.cat(colors_gt_list, dim=0)               # Shape: (N_gt, 3)
+            conf_all = torch.cat(conf_list, dim=0)                   # Shape: (N_pred,)
+            weights_all = torch.cat(weights_list, dim=0)             # Shape: (N_pred,)
+
+            # Ensure that the data is on CPU for Open3D and numpy operations
+            pred_pts_tensor = pred_pts_all.cpu()          # Shape: (N_pred, 3)
+            gt_pts_tensor_icp = gt_pts_all_icp.cpu()      # Shape: (N_pred, 3)
+            gt_pts_tensor_metrics = gt_pts_all_metrics.cpu()  # Shape: (N_gt, 3)
+            colors_pred_tensor = colors_pred_all.cpu()              # Shape: (N_pred, 3)
+            colors_gt_tensor = colors_gt_all.cpu()              # Shape: (N_gt, 3)
+            conf_tensor = conf_all.cpu()                  # Shape: (N_pred,)
+            weights = weights_all.cpu()                   # Shape: (N_pred,)
+
+            print(f"Sample {i}: Number of high-confidence predicted points: {pred_pts_tensor.shape[0]}")
+            print(f"Sample {i}: Number of GT points for ICP: {gt_pts_tensor_icp.shape[0]}")
+            print(f"Sample {i}: Number of GT points for metrics: {gt_pts_tensor_metrics.shape[0]}")
+
+            # Align predicted points to GT using roma.rigid_points_registration with weights
+            start_time = time.time()
+
+            # Input tensors for ICP alignment (must have the same shape)
+            x = pred_pts_tensor          # High-confidence predicted points (N_pred, 3)
+            y = gt_pts_tensor_icp        # Corresponding GT points (N_pred, 3)
+
+            # Compute the rigid transformation with scaling and weights
+            R, t, s = roma.rigid_points_registration(x, y, weights=weights, compute_scaling=True)
+
+            alignment_time = time.time() - start_time
+            print(f"Alignment time using roma with weights for sample {i}: {alignment_time:.4f} seconds")
+
+            # Apply the transformation to the predicted points
+            pred_aligned = s * (x @ R.T) + t  # Shape: (N_pred, 3)
+
+            # Estimate normals
+            start_time = time.time()
+            # Create point clouds in Open3D for normal estimation
+
+            # Predicted point cloud (high-confidence points)
+            pred_pcd = o3d.geometry.PointCloud()
+            pred_pcd.points = o3d.utility.Vector3dVector(pred_aligned.numpy())
+            pred_pcd.colors = o3d.utility.Vector3dVector(colors_pred_tensor.numpy())
+            pred_pcd.estimate_normals()
+
+            # Ground truth point cloud for metrics (all valid points)
+            gt_pcd = o3d.geometry.PointCloud()
+            gt_pcd.points = o3d.utility.Vector3dVector(gt_pts_tensor_metrics.numpy())
+            gt_pcd.colors = o3d.utility.Vector3dVector(colors_gt_tensor.numpy())
+            gt_pcd.estimate_normals()
+            normals_time = time.time() - start_time
+            print(f"Normal estimation time for sample {i}: {normals_time:.4f} seconds")
+
+            # Get normals
+            pred_normals = np.asarray(pred_pcd.normals)
+            gt_normals = np.asarray(gt_pcd.normals)
+
+            # Convert point clouds to numpy arrays for evaluation
+            pred_points_np = np.asarray(pred_pcd.points)
+            gt_points_np = np.asarray(gt_pcd.points)
+
+            # Save the GT and predicted point clouds (separately) for visualization
+            # Define file paths
+            gt_pcd_path = f"gt_pcd_sample_{i}.ply"
+            pred_pcd_path = f"pred_pcd_sample_{i}.ply"
+            # Save the GT point cloud
+            o3d.io.write_point_cloud(gt_pcd_path, gt_pcd)
+            # Save the predicted point cloud
+            o3d.io.write_point_cloud(pred_pcd_path, pred_pcd)
+
+            # Compute metrics
+            start_time = time.time()
+            acc, acc_med, nc1, nc1_med = accuracy(
+                gt_points_np, pred_points_np, gt_normals, pred_normals
+            )
+            comp, comp_med, nc2, nc2_med = completion(
+                gt_points_np, pred_points_np, gt_normals, pred_normals
+            )
+            metrics_time = time.time() - start_time
+            print(f"Metrics computation time for sample {i}: {metrics_time:.4f} seconds")
+            print(f"Accuracy: {acc:.4f}, Accuracy median: {acc_med:.4f}")
+            print(f"Completion: {comp:.4f}, Completion median: {comp_med:.4f}")
+            print(f"Normal consistency 1: {nc1:.4f}, Normal consistency 1 median: {nc1_med:.4f}")
+            print(f"Normal consistency 2: {nc2:.4f}, Normal consistency 2 median: {nc2_med:.4f}")
+
+            # Return metrics
+            return acc, acc_med, comp, comp_med, nc1, nc1_med, nc2, nc2_med
+
+        # Use ThreadPoolExecutor to parallelize across samples
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(process_sample, i) for i in range(batch_size)]
+            for future in futures:
+                acc, acc_med, comp, comp_med, nc1, nc1_med, nc2, nc2_med = future.result()
+                # Collect metrics
+                acc_list.append(acc)
+                acc_med_list.append(acc_med)
+                comp_list.append(comp)
+                comp_med_list.append(comp_med)
+                nc1_list.append(nc1)
+                nc1_med_list.append(nc1_med)
+                nc2_list.append(nc2)
+                nc2_med_list.append(nc2_med)
+
+        # After processing all samples in batch, compute mean and median metrics
+        mean_accuracy = np.mean(acc_list)
+        median_accuracy = np.median(acc_list)
+        mean_completion = np.mean(comp_list)
+        median_completion = np.median(comp_list)
+        mean_nc1 = np.mean(nc1_list)
+        median_nc1 = np.median(nc1_list)
+        mean_nc2 = np.mean(nc2_list)
+        median_nc2 = np.median(nc2_list)
+
+        # Update and log metrics
+        getattr(self, f'val_recon_{dataset_name}_accuracy')(mean_accuracy)
+        self.log(f"val_recon_{dataset_name}/accuracy", getattr(self, f'val_recon_{dataset_name}_accuracy'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+        getattr(self, f'val_recon_{dataset_name}_accuracy_median')(median_accuracy)
+        self.log(f"val_recon_{dataset_name}/accuracy_median", getattr(self, f'val_recon_{dataset_name}_accuracy_median'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+        getattr(self, f'val_recon_{dataset_name}_completion')(mean_completion)
+        self.log(f"val_recon_{dataset_name}/completion", getattr(self, f'val_recon_{dataset_name}_completion'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+        getattr(self, f'val_recon_{dataset_name}_completion_median')(median_completion)
+        self.log(f"val_recon_{dataset_name}/completion_median", getattr(self, f'val_recon_{dataset_name}_completion_median'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+        getattr(self, f'val_recon_{dataset_name}_nc1')(mean_nc1)
+        self.log(f"val_recon_{dataset_name}/nc1", getattr(self, f'val_recon_{dataset_name}_nc1'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+        getattr(self, f'val_recon_{dataset_name}_nc1_median')(median_nc1)
+        self.log(f"val_recon_{dataset_name}/nc1_median", getattr(self, f'val_recon_{dataset_name}_nc1_median'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+        getattr(self, f'val_recon_{dataset_name}_nc2')(mean_nc2)
+        self.log(f"val_recon_{dataset_name}/nc2", getattr(self, f'val_recon_{dataset_name}_nc2'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+        getattr(self, f'val_recon_{dataset_name}_nc2_median')(median_nc2)
+        self.log(f"val_recon_{dataset_name}/nc2_median", getattr(self, f'val_recon_{dataset_name}_nc2_median'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+
     def evaluate_camera_poses(self, views, preds, estimate_focal_from_first_view=False):
         """Evaluate camera poses and focal lengths using fast_pnp in parallel."""
-        batch_size = views[0]["img"].shape[0]
+
+        # in-place correction of the orientation of the predicted points and confidence maps
+        # this is because the data loader transposed the input images and valid_masks to landscape
+        self.correct_preds_orientation(preds, views)
 
         # Estimate camera poses using the provided function
-        poses_c2w_estimated, estimated_focals = self.estimate_camera_poses(preds=preds, views=views, niter_PnP=10, device=self.device, estimate_focal_from_first_view=estimate_focal_from_first_view)
+        poses_c2w_estimated, estimated_focals = self.estimate_camera_poses(preds=preds, views=views, niter_PnP=10, estimate_focal_from_first_view=estimate_focal_from_first_view)
 
         # Get ground truth poses
         poses_c2w_gt = [view['camera_pose'] for view in views]
@@ -255,6 +520,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
                 return results
 
             # Use ThreadPoolExecutor to process samples in parallel across the batch
+            batch_size = views[0]["img"].shape[0]
             with ThreadPoolExecutor() as executor:
                 batch_results = list(executor.map(process_sample, range(batch_size)))
 
@@ -274,40 +540,8 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
     # Function to estimate camera poses using fast_pnp
     @staticmethod
-    def estimate_camera_poses(preds, views=None, niter_PnP=10, device='cpu', estimate_focal_from_first_view=False):
+    def estimate_camera_poses(preds, views=None, niter_PnP=10, estimate_focal_from_first_view=False):
         """Estimate camera poses and focal lengths using fast_pnp in parallel."""
-        # correct the shape of the predicted points and confidence maps if the view is portrait
-        # this is because the data loader transposed the input images and valid_masks to landscape
-        # see datasets/base/base_stereo_view_dataset.py
-        if views is not None:
-            for pred, view in zip(preds, views):
-                # debug: use GT point map to estimate poses
-                # pred["pts3d_in_other_view"] = view["pts3d"]  # shape (B, H, W, 3)
-                # pred["conf"] = view['valid_mask'].float() if "valid_mask" in view else torch.ones_like(pred["conf"])  # shape (B, H, W)
-                # pred["focal_length"] = view["camera_intrinsics"][:, 0, :2].sum(1)
-                # end debug
-
-                # check if the view is protrait or landscape (true_shape: (H, W))
-                conf_list = []
-                pts3d_list = []
-
-                for i in range(view["true_shape"].shape[0]):
-                    H, W = view["true_shape"][i]
-                    if H > W:  # portrait
-                        # Transpose the tensors
-                        transposed_conf = pred["conf"][i].transpose(0, 1)
-                        transposed_pts3d = pred["pts3d_in_other_view"][i].transpose(0, 1)
-
-                        # Append the transposed tensors to the lists
-                        conf_list.append(transposed_conf)
-                        pts3d_list.append(transposed_pts3d)
-                    else:
-                        # Append the original tensors to the lists
-                        conf_list.append(pred["conf"][i])
-                        pts3d_list.append(pred["pts3d_in_other_view"][i])
-
-                pred["conf"] = conf_list
-                pred["pts3d_in_other_view"] = pts3d_list
 
         batch_size = len(preds[0]["pts3d_in_other_view"])  # Get the batch size
 
@@ -347,7 +581,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
         # Use partial to fix arguments
         from functools import partial
 
-        estimate_cam_pose_one_sample_partial = partial(estimate_cam_pose_one_sample, device=device, niter_PnP=niter_PnP)
+        estimate_cam_pose_one_sample_partial = partial(estimate_cam_pose_one_sample, niter_PnP=niter_PnP)
 
         with ThreadPoolExecutor() as executor:
             results = list(executor.map(estimate_cam_pose_one_sample_partial, data_for_processing))
@@ -358,6 +592,43 @@ class MultiViewDUSt3RLitModule(LightningModule):
             estimated_focals_all.append(estimated_focals_sample)
 
         return poses_c2w_all, estimated_focals_all
+
+    @staticmethod
+    def correct_preds_orientation(preds, views):
+        # *In-place* correction of the orientation of the predicted points and confidence maps
+
+        # correct the shape of the predicted points and confidence maps if the view is portrait
+        # this is because the data loader transposed the input images and valid_masks to landscape
+        # see datasets/base/base_stereo_view_dataset.py
+        if views is not None:
+            for pred, view in zip(preds, views):
+                # debug: use GT point map to estimate poses
+                # pred["pts3d_in_other_view"] = view["pts3d"]  # shape (B, H, W, 3)
+                # pred["conf"] = view['valid_mask'].float() if "valid_mask" in view else torch.ones_like(pred["conf"])  # shape (B, H, W)
+                # pred["focal_length"] = view["camera_intrinsics"][:, 0, :2].sum(1)
+                # end debug
+
+                # check if the view is protrait or landscape (true_shape: (H, W))
+                conf_list = []
+                pts3d_list = []
+
+                for i in range(view["true_shape"].shape[0]):
+                    H, W = view["true_shape"][i]
+                    if H > W:  # portrait
+                        # Transpose the tensors
+                        transposed_conf = pred["conf"][i].transpose(0, 1)
+                        transposed_pts3d = pred["pts3d_in_other_view"][i].transpose(0, 1)
+
+                        # Append the transposed tensors to the lists
+                        conf_list.append(transposed_conf)
+                        pts3d_list.append(transposed_pts3d)
+                    else:
+                        # Append the original tensors to the lists
+                        conf_list.append(pred["conf"][i])
+                        pts3d_list.append(pred["pts3d_in_other_view"][i])
+
+                pred["conf"] = conf_list
+                pred["pts3d_in_other_view"] = pts3d_list
 
     def configure_optimizers(self) -> Dict[str, Any]:
         optimizer = self.hparams.optimizer(params=self.trainer.model.parameters())
@@ -425,7 +696,18 @@ class MultiViewDUSt3RLitModule(LightningModule):
             self.net.load_state_dict(ckpt["model"], strict=False)
             del ckpt  # in case it occupies memory
         elif isinstance(self.net, Fast3R):
-            self.net.load_from_dust3r_checkpoint(self.pretrained)
+            if self.pretrained.endswith("DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"):
+                # if the model is Fast3R and the pretrained model is DUSt3R, load a subset of the weights into the net
+                self.net.load_from_dust3r_checkpoint(self.pretrained)
+            else:
+                # if the checkpoint is also Fast3R, load all weights
+                log.info(f"Loading pretrained weights from {self.pretrained}")
+                checkpoint = torch.load(self.pretrained)
+                filtered_state_dict = {k: v for k, v in checkpoint['state_dict'].items() if k.startswith('net.')}
+                # Remove the 'net.' prefix from the keys
+                filtered_state_dict = {k[len('net.'):]: v for k, v in filtered_state_dict.items()}
+                # Load the filtered state_dict into the model
+                self.net.load_state_dict(filtered_state_dict, strict=True)
 
     @staticmethod
     def _update_ckpt_keys(ckpt, new_head_name='downstream_head', head_to_keep='downstream_head1', head_to_discard='downstream_head2'):
@@ -461,7 +743,7 @@ def estimate_cam_pose_one_sample(sample_preds, device='cpu', niter_PnP=10):
             torch.tensor(pts3d),
             focal_length,  # Guess focal length
             torch.tensor(valid_mask, dtype=torch.bool),
-            device,
+            "cpu",
             pp=None,  # Use default principal point (center of image)
             niter_PnP=niter_PnP
         )

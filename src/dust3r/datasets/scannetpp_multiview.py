@@ -7,12 +7,13 @@ from src.dust3r.datasets.base.base_stereo_view_dataset import BaseStereoViewData
 from src.dust3r.utils.image import imread_cv2
 
 class ScanNetpp_Multiview(BaseStereoViewDataset):
-    def __init__(self, num_views=4, window_size=60, num_samples_per_window=100, *args, ROOT, **kwargs):
+    def __init__(self, num_views=4, window_size=60, num_samples_per_window=100, ordered=False, *args, ROOT, **kwargs):
         super().__init__(*args, **kwargs)
         self.ROOT = ROOT
         self.num_views = num_views
         self.window_size = window_size
         self.num_samples_per_window = num_samples_per_window
+        self.ordered = ordered
         assert self.split == 'train'
         self.loaded_data = self._load_data()
         self._generate_combinations()
@@ -32,24 +33,42 @@ class ScanNetpp_Multiview(BaseStereoViewDataset):
         self.combinations = []
         self.scene_to_indices = {}
 
-        # Group indices by scene
+        # Group and sort indices by scene, then segregate by iPhone/DSLR patterns
         for idx, scene_id in enumerate(self.sceneids):
             if scene_id not in self.scene_to_indices:
-                self.scene_to_indices[scene_id] = []
-            self.scene_to_indices[scene_id].append(idx)
+                self.scene_to_indices[scene_id] = {'iphone': [], 'dslr': []}
 
-        # Generate combinations within each scene
-        for indices in self.scene_to_indices.values():
-            if len(indices) >= self.num_views:
-                max_index_diff = self.window_size
-                for i in range(len(indices)):
-                    window_start = max(0, i - max_index_diff // 2)
-                    window_end = min(len(indices), i + max_index_diff // 2)
-                    window_indices = indices[window_start:window_end]
-                    for _ in range(self.num_samples_per_window):
-                        if len(window_indices) >= self.num_views:
-                            combo = random.sample(window_indices, self.num_views)
-                            self.combinations.append(tuple(combo))
+            # Sort by image pattern type
+            if "frame_" in self.images[idx]:  # iPhone pattern
+                self.scene_to_indices[scene_id]['iphone'].append(idx)
+            else:  # DSLR pattern
+                self.scene_to_indices[scene_id]['dslr'].append(idx)
+
+        # Sort indices in temporal order within each scene's iPhone and DSLR list
+        for scene_dict in self.scene_to_indices.values():
+            scene_dict['iphone'].sort(key=lambda idx: self.images[idx])
+            scene_dict['dslr'].sort(key=lambda idx: self.images[idx])
+
+        # Generate combinations within each segregated list
+        for scene_dict in self.scene_to_indices.values():
+            for device_type in ['iphone', 'dslr']:
+                indices = scene_dict[device_type]
+                if len(indices) >= self.num_views:
+                    max_index_diff = self.window_size
+                    for i in range(len(indices)):
+                        window_start = max(0, i - max_index_diff // 2)
+                        window_end = min(len(indices), i + max_index_diff // 2)
+                        window_indices = indices[window_start:window_end]
+
+                        for _ in range(self.num_samples_per_window):
+                            if len(window_indices) >= self.num_views:
+                                combo = random.sample(window_indices, self.num_views)
+                                
+                                # If ordered, sort based on the order in window_indices
+                                if self.ordered:
+                                    combo = sorted(combo, key=lambda x: window_indices.index(x))
+                                
+                                self.combinations.append(tuple(combo))
 
         # Remove duplicates and sort the combinations
         self.combinations = sorted(set(self.combinations))
@@ -60,13 +79,17 @@ class ScanNetpp_Multiview(BaseStereoViewDataset):
     def _get_views(self, idx, resolution, rng):
         image_indices = self.combinations[idx]
 
-        # Ensure the indices stay within the scene boundaries
+        # Determine device type based on the first index in image_indices
         scene_id = self.sceneids[image_indices[0]]
-        valid_indices = self.scene_to_indices[scene_id]
+        device_type = 'iphone' if "frame_" in self.images[image_indices[0]] else 'dslr'
+        valid_indices = self.scene_to_indices[scene_id][device_type]
 
-        # Add a bit of randomness
+        # Add a bit of randomness within the valid indices
         random_offsets = [rng.integers(-2, 3) for _ in image_indices]
-        image_indices = [valid_indices[max(0, min(valid_indices.index(im_idx) + offset, len(valid_indices) - 1))] for im_idx, offset in zip(image_indices, random_offsets)]
+        image_indices = [
+            valid_indices[max(0, min(valid_indices.index(im_idx) + offset, len(valid_indices) - 1))]
+            for im_idx, offset in zip(image_indices, random_offsets)
+        ]
 
         views = []
         for view_idx in image_indices:

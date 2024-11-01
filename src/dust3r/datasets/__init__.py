@@ -5,6 +5,7 @@ from .base.batched_sampler import BatchedRandomSampler  # noqa
 from .arkitscenes import ARKitScenes  # noqa
 from .arkitscenes_multiview import ARKitScenes_Multiview  # noqa
 from .blendedmvs import BlendedMVS  # noqa
+from .blendedmvs_multiview import BlendedMVS_Multiview  # noqa
 from .co3d import Co3d  # noqa
 from .co3d_multiview import Co3d_Multiview  # noqa: F401
 from .habitat import Habitat  # noqa
@@ -16,7 +17,7 @@ from .scannetpp_multiview import ScanNetpp_Multiview  # noqa
 from .staticthings3d import StaticThings3D  # noqa
 from .waymo import Waymo  # noqa
 from .wildrgbd import WildRGBD  # noqa
-
+from src.data.components.spann3r_datasets import *  # noqa
 
 def get_data_loader(dataset, batch_size, num_workers=8, shuffle=True, drop_last=True, pin_mem=True):
     import torch

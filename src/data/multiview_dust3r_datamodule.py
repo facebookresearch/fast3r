@@ -5,6 +5,8 @@ from lightning.pytorch.utilities.combined_loader import CombinedLoader
 from torch.utils.data import DataLoader, Dataset, random_split
 from src.dust3r.datasets import get_data_loader
 from src.dust3r.datasets import *
+from src.data.components.spann3r_datasets import *
+from src.dust3r.datasets.base.easy_dataset import ResizedDataset
 
 class MultiViewDUSt3RDataModule(LightningDataModule):
     """LightningDataModule for the custom dataset.
@@ -123,17 +125,31 @@ class MultiViewDUSt3RDataModule(LightningDataModule):
         val_datasets = [eval(dataset) for dataset in self.hparams.validation_datasets]
 
         # Create individual validation data loaders for each dataset
-        val_loaders = [
-            get_data_loader(
-                dataset,
-                batch_size=self.batch_size_per_device_val,
-                num_workers=self.num_workers,
-                pin_mem=self.pin_memory,
-                shuffle=False,
-                drop_last=False,  # set to False if you want to keep the last batch, e.g., for precise evaluation
+        val_loaders = []
+        for dataset in val_datasets:
+            # if isinstance(dataset, ResizedDataset):
+            #     if isinstance(dataset.dataset, (NRGBD, SevenScenes)):
+            #         batch_size = 1
+            #     else:
+            #         batch_size = self.batch_size_per_device_val
+            # else:
+            #     if isinstance(dataset, (NRGBD, SevenScenes)):
+            #         batch_size = 1
+            #     else:
+            #         batch_size = self.batch_size_per_device_val
+
+            dataset.set_ratio(1.0)  # FIXME: Check if this is correct # the spann3r datasets have a set_ratio method
+
+            val_loaders.append(
+                get_data_loader(
+                    dataset,
+                    batch_size=self.batch_size_per_device_val,
+                    num_workers=self.num_workers,
+                    pin_mem=self.pin_memory,
+                    shuffle=False,
+                    drop_last=False,  # set to False if you want to keep the last batch, e.g., for precise evaluation
+                )
             )
-            for dataset in val_datasets
-        ]
 
         # Set epoch for each validation loader (if applicable)
         for loader in val_loaders:

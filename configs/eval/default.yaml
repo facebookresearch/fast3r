@@ -3,7 +3,7 @@
 data:
   num_views: 12
   data_module:
-    train_datasets: []
+    train_datasets: [] # do not initialize any datasets for training
     num_workers: 0 # debuggers don't like multiprocessing
     pin_memory: false # disable gpu memory pin
     batch_size_per_device: 6

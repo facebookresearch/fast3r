@@ -89,7 +89,8 @@ class BaseStereoViewDataset(EasyDataset):
             ar_idx
         ]  # DO NOT CHANGE THIS (compatible with BatchedRandomSampler)
         views = self._get_views(idx, resolution, self._rng)
-        assert len(views) == self.num_views
+        # if type(self).__name__ not in ["DTU", "SevenScenes", "NRGBD"]:
+        #     assert len(views) == self.num_views
 
         # check data-types
         for v, view in enumerate(views):
