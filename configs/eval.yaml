@@ -3,9 +3,9 @@
 defaults:
   - _self_
   - data: multiview_dust3r
-  - model: multiview_dust3r
-  - logger: null
-  - trainer: ddp
+  - model: fast3r
+  - logger: many_loggers
+  - trainer: ddp_eval
   - paths: default
   - extras: default
   - hydra: default
@@ -13,7 +13,7 @@ defaults:
 
 task_name: "eval"
 
-tags: ["dev"]
+tags: ["eval"]
 
 # passing checkpoint path is necessary for evaluation
 ckpt_path: ???

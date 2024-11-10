@@ -13,7 +13,7 @@ from src.dust3r.utils.misc import invalid_to_nans
 
 
 def loss_of_one_batch(
-    batch, model, criterion, device, precision, symmetrize_batch=False, use_amp=False, ret=None
+    batch, model, criterion, device, precision, symmetrize_batch=False, use_amp=False, ret=None, profiling=False,
 ):
     """
     Args:
@@ -40,7 +40,7 @@ def loss_of_one_batch(
         autocast_dict["dtype"] = torch.bfloat16
 
     with torch.autocast(**autocast_dict):
-        preds = model(views)
+        preds = model(views, profiling=profiling)
 
         # loss is supposed to be symmetric
         loss = (
@@ -52,7 +52,7 @@ def loss_of_one_batch(
 
 
 @torch.no_grad()
-def inference(multiple_views_in_one_sample, model, device, dtype, verbose=True):
+def inference(multiple_views_in_one_sample, model, device, dtype, verbose=True, profiling=False):
     if verbose:
         print(f">> Inference with model on {len(multiple_views_in_one_sample)} images")
     result = []
@@ -63,7 +63,7 @@ def inference(multiple_views_in_one_sample, model, device, dtype, verbose=True):
         batch_size = 1
 
     res = loss_of_one_batch(
-        collate_with_cat([tuple(multiple_views_in_one_sample)]), model, None, device, dtype
+        collate_with_cat([tuple(multiple_views_in_one_sample)]), model, None, device, dtype, profiling=profiling
     )
     result.append(to_cpu(res))
 

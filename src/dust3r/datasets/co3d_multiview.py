@@ -19,6 +19,7 @@ class Co3d_Multiview(BaseStereoViewDataset):
         self.num_samples_per_window = num_samples_per_window
         assert mask_bg in (True, False, "rand")
         self.mask_bg = mask_bg
+        self.invalid_scene_tracker = set()  # Track scenes that have all images invalid
 
         # Load all scenes
         with open(osp.join(self.ROOT, f"selected_seqs_{self.split}.json"), "r") as f:
@@ -57,100 +58,107 @@ class Co3d_Multiview(BaseStereoViewDataset):
         # Remove duplicates and sort the combinations
         self.combinations = sorted(set(self.combinations))
 
-    def __len__(self):
-        return len(self.scene_list) * len(self.combinations)
-
-    def _get_views(self, idx, resolution, rng):
-        # Choose a scene
-        obj, instance = self.scene_list[idx // len(self.combinations)]
-        image_pool = self.scenes[obj, instance]
-        im_indices = self.combinations[idx % len(self.combinations)]
-
-        if resolution not in self.invalidate[obj, instance]:  # Flag invalid images
-            self.invalidate[obj, instance][resolution] = [
-                False for _ in range(len(image_pool))
-            ]
-
-        # Decide now if we mask the bg
-        mask_bg = (self.mask_bg == True) or (self.mask_bg == "rand" and rng.choice(2))
-
-        # Add a bit of randomness
+    def _fetch_views_for_pool(self, obj, instance, image_pool, resolution, rng):
+        """Attempt to get valid views from a single image_pool, with oversampling if needed."""
         last = len(image_pool) - 1
+        imgs_idxs = deque([max(0, min(im_idx + rng.integers(-4, 5), last)) for im_idx in self.combinations[0]])
+
+        # Collect views and track validity
         views = []
-        imgs_idxs = [
-            max(0, min(im_idx + rng.integers(-4, 5), last))
-            for im_idx in im_indices
-        ]
-        imgs_idxs = deque(imgs_idxs)
-        while len(imgs_idxs) > 0:  # Some images (few) have zero depth
+        valid_imgs = []
+
+        while imgs_idxs:
             im_idx = imgs_idxs.pop()
+            if self.invalidate[obj, instance][resolution][im_idx]:  # Skip invalid images
+                continue
 
-            if self.invalidate[obj, instance][resolution][im_idx]:
-                # Search for a valid image
-                random_direction = 2 * rng.choice(2) - 1
-                for offset in range(1, len(image_pool)):
-                    tentative_im_idx = (im_idx + (random_direction * offset)) % len(
-                        image_pool
-                    )
-                    if not self.invalidate[obj, instance][resolution][tentative_im_idx]:
-                        im_idx = tentative_im_idx
-                        break
+            # Attempt to load view data
+            view_data = self._load_view_data(obj, instance, image_pool, im_idx, resolution, rng)
+            if view_data:
+                views.append(view_data)
+                valid_imgs.append(im_idx)  # Track valid images
+                if len(views) == self.num_views:
+                    return views  # Return if we have enough valid views
 
+        # If not enough views, oversample from valid images in the pool
+        while len(views) < self.num_views and valid_imgs:
+            im_idx = random.choice(valid_imgs)  # Randomly oversample from valid images
+            view_data = self._load_view_data(obj, instance, image_pool, im_idx, resolution, rng)
+            if view_data:
+                views.append(view_data)
+
+        # Return views if enough valid ones were found; otherwise, return None
+        return views if len(views) == self.num_views else None
+
+    def _get_views(self, idx, resolution, rng, max_scene_retries=5):
+        """Attempt to get views, retrying with different scenes if necessary."""
+        for attempt in range(max_scene_retries):
+            # Select a different scene on each retry by applying an offset based on `attempt`
+            scene_idx = (idx + attempt) % len(self.scene_list)
+            obj, instance = self.scene_list[scene_idx]
+
+            # Skip scenes that are known to be invalid
+            if (obj, instance) in self.invalid_scene_tracker:
+                continue
+
+            image_pool = self.scenes[obj, instance]
+            if resolution not in self.invalidate[obj, instance]:
+                self.invalidate[obj, instance][resolution] = [False] * len(image_pool)
+
+            views = self._fetch_views_for_pool(obj, instance, image_pool, resolution, rng)
+            if views:
+                return views  # Successfully found views
+
+            # If no valid views, mark the scene as invalid and log a warning
+            print(f"Warning: Scene {obj, instance} has all images invalid. Skipping.")
+            self.invalid_scene_tracker.add((obj, instance))
+
+        raise ValueError(f"Exceeded {max_scene_retries=}. No valid views found.")
+
+    def _load_view_data(self, obj, instance, image_pool, im_idx, resolution, rng):
+        """Load the data for a single view, including image, depth, and camera parameters."""
+        try:
             view_idx = image_pool[im_idx]
-
-            impath = osp.join(
-                self.ROOT, obj, instance, "images", f"frame{view_idx:06n}.jpg"
-            )
-
-            # Load camera params
+            impath = osp.join(self.ROOT, obj, instance, "images", f"frame{view_idx:06n}.jpg")
             input_metadata = np.load(impath.replace("jpg", "npz"))
             camera_pose = input_metadata["camera_pose"].astype(np.float32)
             intrinsics = input_metadata["camera_intrinsics"].astype(np.float32)
 
-            # Load image and depth
             rgb_image = imread_cv2(impath)
-            depthmap = imread_cv2(
-                impath.replace("images", "depths") + ".geometric.png",
-                cv2.IMREAD_UNCHANGED,
-            )
-            depthmap = (depthmap.astype(np.float32) / 65535) * np.nan_to_num(
-                input_metadata["maximum_depth"]
-            )
+            depthmap = imread_cv2(impath.replace("images", "depths") + ".geometric.png", cv2.IMREAD_UNCHANGED)
+            depthmap = (depthmap.astype(np.float32) / 65535) * np.nan_to_num(input_metadata["maximum_depth"])
 
-            if mask_bg:
-                # Load object mask
-                maskpath = osp.join(
-                    self.ROOT, obj, instance, "masks", f"frame{view_idx:06n}.png"
-                )
+            # Background masking logic
+            if self.mask_bg:
+                maskpath = osp.join(self.ROOT, obj, instance, "masks", f"frame{view_idx:06n}.png")
                 maskmap = imread_cv2(maskpath, cv2.IMREAD_UNCHANGED).astype(np.float32)
                 maskmap = (maskmap / 255.0) > 0.1
-
-                # Update the depthmap with mask
                 depthmap *= maskmap
 
+            # Crop, resize, and validate
             rgb_image, depthmap, intrinsics = self._crop_resize_if_necessary(
                 rgb_image, depthmap, intrinsics, resolution, rng=rng, info=impath
             )
-
-            num_valid = (depthmap > 0.0).sum()
-            if num_valid == 0:
-                # Problem, invalidate image and retry
+            if (depthmap > 0.0).sum() == 0:
+                # Mark as invalid and return None if no valid depth
                 self.invalidate[obj, instance][resolution][im_idx] = True
-                imgs_idxs.append(im_idx)
-                continue
+                return None
 
-            views.append(
-                dict(
-                    img=rgb_image,
-                    depthmap=depthmap,
-                    camera_pose=camera_pose,
-                    camera_intrinsics=intrinsics,
-                    dataset="Co3d_v2",
-                    label=osp.join(obj, instance),
-                    instance=osp.split(impath)[1],
-                )
+            return dict(
+                img=rgb_image,
+                depthmap=depthmap,
+                camera_pose=camera_pose,
+                camera_intrinsics=intrinsics,
+                dataset="Co3d_v2",
+                label=osp.join(obj, instance),
+                instance=osp.split(impath)[1],
             )
-        return views
+        except Exception as e:
+            print(f"Error loading view data for image {impath}: {e}")
+            return None
+
+    def __len__(self):
+        return len(self.scene_list) * len(self.combinations)
 
 
 if __name__ == "__main__":

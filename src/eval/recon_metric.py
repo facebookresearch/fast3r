@@ -1,17 +1,18 @@
 import numpy as np
 from scipy.spatial import cKDTree as KDTree
 from sklearn.neighbors import NearestNeighbors
+import faiss
 
 def completion_ratio(gt_points, rec_points, dist_th=0.05):
     gen_points_kd_tree = KDTree(rec_points)
-    distances, _ = gen_points_kd_tree.query(gt_points)
+    distances, _ = gen_points_kd_tree.query(gt_points, workers=36)
     comp_ratio = np.mean((distances < dist_th).astype(np.float32))
     return comp_ratio
 
 
-def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None):
+def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None, device=None):
     gt_points_kd_tree = KDTree(gt_points)
-    distances, idx = gt_points_kd_tree.query(rec_points)
+    distances, idx = gt_points_kd_tree.query(rec_points, workers=36)
     acc = np.mean(distances)
 
     acc_median = np.median(distances)
@@ -25,9 +26,9 @@ def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None):
     return acc, acc_median
 
 
-def completion(gt_points, rec_points, gt_normals=None, rec_normals=None):
+def completion(gt_points, rec_points, gt_normals=None, rec_normals=None, device=None):
     gt_points_kd_tree = KDTree(rec_points)
-    distances, idx = gt_points_kd_tree.query(gt_points)
+    distances, idx = gt_points_kd_tree.query(gt_points, workers=36)
     comp = np.mean(distances)
     comp_median = np.median(distances)
 
@@ -36,8 +37,53 @@ def completion(gt_points, rec_points, gt_normals=None, rec_normals=None):
         normal_dot = np.abs(normal_dot)
 
         return comp, comp_median, np.mean(normal_dot), np.median(normal_dot)
-    
+
     return comp, comp_median
+
+def accuracy_faiss(gt_points, rec_points, gt_normals=None, rec_normals=None, device=None):
+    # Set up the Faiss index on GPU for the ground truth points
+    d = gt_points.shape[1]  # Dimension of the points
+    index = faiss.IndexFlatL2(d)  # L2 distance index
+    # index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), device.index, index)
+
+    # Add ground truth points to the index
+    index.add(gt_points.astype(np.float32))
+
+    # Perform nearest neighbor search from reconstructed points to ground truth points
+    distances, idx = index.search(rec_points.astype(np.float32), 1)
+    acc = np.mean(distances)
+    acc_median = np.median(distances)
+
+    # Normal alignment calculations, if available
+    if gt_normals is not None and rec_normals is not None:
+        normal_dot = np.sum(gt_normals[idx.squeeze()] * rec_normals, axis=-1)
+        normal_dot = np.abs(normal_dot)
+        return acc, acc_median, np.mean(normal_dot), np.median(normal_dot)
+
+    return acc, acc_median
+
+def completion_faiss(gt_points, rec_points, gt_normals=None, rec_normals=None, device=None):
+    # Set up the Faiss index on GPU for the reconstructed points
+    d = rec_points.shape[1]  # Dimension of the points
+    index = faiss.IndexFlatL2(d)  # L2 distance index
+    # index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), device.index, index)
+
+    # Add reconstructed points to the index
+    index.add(rec_points.astype(np.float32))
+
+    # Perform nearest neighbor search from ground truth points to reconstructed points
+    distances, idx = index.search(gt_points.astype(np.float32), 1)
+    comp = np.mean(distances)
+    comp_median = np.median(distances)
+
+    # Normal alignment calculations, if available
+    if gt_normals is not None and rec_normals is not None:
+        normal_dot = np.sum(gt_normals * rec_normals[idx.squeeze()], axis=-1)
+        normal_dot = np.abs(normal_dot)
+        return comp, comp_median, np.mean(normal_dot), np.median(normal_dot)
+
+    return comp, comp_median
+
 
 def downsample_point_cloud(points, thresh):
     """

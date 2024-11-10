@@ -67,9 +67,20 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
         path_2 = self.scratch.refinenet2(path_3, layers[1])
         path_1 = self.scratch.refinenet1(path_2, layers[0])
 
-        # Output head
-        out = self.head(path_1)
+        # Split input into chunks to avoid memory issues with large batches
+        if self.training:
+            max_chunk_size = 1
+        else:
+            max_chunk_size = 50
+        chunks = torch.split(path_1, max_chunk_size, dim=0)
+        outputs = []
 
+        for chunk in chunks:
+            out_chunk = self.head(chunk)
+            outputs.append(out_chunk)
+
+        # Concatenate outputs along the batch dimension
+        out = torch.cat(outputs, dim=0)
         return out
 
 

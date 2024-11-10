@@ -74,18 +74,26 @@ class ManyAR_PatchEmbed(PatchEmbed):
         is_portrait = ~is_landscape
 
         # linear projection, transposed if necessary
-        new_landscape_content = self.proj(img[is_landscape]).permute(0, 2, 3, 1).flatten(1, 2)
-        new_protrait_content = self.proj(img[is_portrait].swapaxes(-1, -2)).permute(0, 2, 3, 1).flatten(1, 2)
+        if is_landscape.any():
+            new_landscape_content = self.proj(img[is_landscape])
+            new_landscape_content = new_landscape_content.permute(0, 2, 3, 1).flatten(1, 2)
+        if is_portrait.any():
+            new_protrait_content = self.proj(img[is_portrait].swapaxes(-1, -2))
+            new_protrait_content = new_protrait_content.permute(0, 2, 3, 1).flatten(1, 2)
 
         # allocate space for result and set the content
-        x = img.new_zeros((B, n_tokens, self.embed_dim), dtype=new_landscape_content.dtype)  # dynamically set dtype based on the current precision
-        x[is_landscape] = new_landscape_content
-        x[is_portrait] = new_protrait_content
+        x = img.new_empty((B, n_tokens, self.embed_dim), dtype=next(self.named_parameters())[1].dtype)  # dynamically set dtype based on the current precision
+        if is_landscape.any():
+            x[is_landscape] = new_landscape_content
+        if is_portrait.any():
+            x[is_portrait] = new_protrait_content
 
         # allocate space for result and set the content
-        pos = img.new_zeros((B, n_tokens, 2), dtype=torch.int64)
-        pos[is_landscape] = self.position_getter(1, H, W, pos.device)
-        pos[is_portrait] = self.position_getter(1, W, H, pos.device)
+        pos = img.new_empty((B, n_tokens, 2), dtype=torch.int64)
+        if is_landscape.any():
+            pos[is_landscape] = self.position_getter(1, H, W, pos.device).expand(is_landscape.sum(), -1, -1)
+        if is_portrait.any():
+            pos[is_portrait] = self.position_getter(1, W, H, pos.device).expand(is_portrait.sum(), -1, -1)
 
         x = self.norm(x)
         return x, pos

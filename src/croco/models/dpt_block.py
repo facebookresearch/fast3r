@@ -193,7 +193,7 @@ class FeatureFusionBlock_custom(nn.Module):
 
         self.skip_add = nn.quantized.FloatFunctional()
 
-    def forward(self, *xs):
+    def forward(self, *xs, max_chunk_size=100):
         """Forward pass.
         Returns:
             tensor: output
@@ -223,12 +223,23 @@ class FeatureFusionBlock_custom(nn.Module):
                 output, size=(2 * output.shape[2], shape), mode="bilinear"
             )
         else:
-            output = nn.functional.interpolate(
-                output,
-                scale_factor=2,
-                mode="bilinear",
-                align_corners=self.align_corners,
-            )
+            # Split input into chunks to avoid memory issues with large batches
+
+            chunks = torch.split(output, max_chunk_size, dim=0)
+            outputs = []
+
+            for chunk in chunks:
+                out_chunk = nn.functional.interpolate(
+                    chunk,
+                    scale_factor=2,
+                    mode="bilinear",
+                    align_corners=self.align_corners,
+                )
+                outputs.append(out_chunk)
+
+            # Concatenate outputs along the batch dimension
+            output = torch.cat(outputs, dim=0)
+
         output = self.out_conv(output)
         return output
 

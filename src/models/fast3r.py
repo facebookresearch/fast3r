@@ -1,11 +1,14 @@
 import os
 from copy import deepcopy
+import time
+from einops import rearrange
 import huggingface_hub
 from omegaconf import DictConfig
 import torch
 import torch.distributed
 import torch.nn as nn
 import numpy as np
+from src.dust3r.datasets.base.base_stereo_view_dataset import view_name
 from src.dust3r.heads.postprocess import postprocess
 from src.dust3r.heads.dpt_head import PixelwiseTaskWithDPT
 from src.croco.models.blocks import Block, PositionGetter
@@ -54,6 +57,8 @@ class Fast3R(nn.Module,
 
         self.head_args = head_args
         self.build_head(head_args)
+
+        self.max_parallel_views_for_head = 25  # how many views to process in parallel in the head, used to avoid OOM
 
         self.set_freeze(freeze)
 
@@ -223,23 +228,45 @@ class Fast3R(nn.Module,
 
     def _encode_images(self, views):
         B = views[0]["img"].shape[0]
-        encoded_feats, positions, shapes = [], [], []
 
-        # TODO: Batchify this
-        for view in views:
-            img = view["img"]
-            # Recover true_shape when available, otherwise assume that the img shape is the true one
-            true_shape = view.get(
-                "true_shape", torch.tensor(img.shape[-2:])[None].repeat(B, 1)
-            )
-            feat, pos = self.encoder(img, true_shape)
-            encoded_feats.append(feat)
-            positions.append(pos)
-            shapes.append(true_shape)
+        # Check if all images have the same shape
+        same_shape = all(view["img"].shape == views[0]["img"].shape for view in views)
+
+        if same_shape:
+            # Stack images along a new dimension to create a batch
+            imgs = torch.cat([view["img"] for view in views], dim=0)  # Shape: [num_views * B, C, H, W]
+            true_shapes = torch.cat(
+                [view.get("true_shape", torch.tensor(view["img"].shape[-2:])[None].repeat(B, 1)) for view in views],
+                dim=0
+            )  # Shape: [num_views * B, 2]
+
+            # Encode all images in a single batch
+            feats, pos = self.encoder(imgs, true_shapes)
+
+            # Split the encoded features and positions back into individual views
+            encoded_feats = torch.split(feats, B, dim=0)
+            positions = torch.split(pos, B, dim=0)
+            shapes = torch.split(true_shapes, B, dim=0)
+        else:
+            # Process each image individually
+            encoded_feats, positions, shapes = [], [], []
+            for view in views:
+                img = view["img"]
+                true_shape = view.get(
+                    "true_shape", torch.tensor(img.shape[-2:])[None].repeat(B, 1)
+                )
+                feat, pos = self.encoder(img, true_shape)
+                encoded_feats.append(feat)
+                positions.append(pos)
+                shapes.append(true_shape)
 
         return encoded_feats, positions, shapes
 
-    def forward(self, views):
+    def set_max_parallel_views_for_head(self, max_parallel_views_for_head):
+        # expose this to user to control the number of views processed in parallel in the head
+        self.max_parallel_views_for_head = max_parallel_views_for_head
+
+    def forward(self, views, profiling=False):
         """
         Args:
             views (list[dict]): a list of views, each view is a dict of tensors, the tensors are batched
@@ -248,9 +275,19 @@ class Fast3R(nn.Module,
             list[dict]: a list of results for each view
         """
         # encode the images --> B,S,D
+        encode_images_start_time = time.time()
         encoded_feats, positions, shapes = self._encode_images(views)
+        encode_images_end_time = time.time()
+        if profiling:
+            print(f"encode_images time: {encode_images_end_time - encode_images_start_time}")
+        if encode_images_end_time - encode_images_start_time > 20:
+            print(f"something is wrong with the encoder, it took: {encode_images_end_time - encode_images_start_time}")
+            # print the image and true_shape
+            for view_idx, view in enumerate(views):
+                print(f"view_idx: {view_idx}\n, view name: {view_name(view)}\n, image content: {view['img']}\n, true_shape: {view['true_shape']}")
 
         # Create image IDs for each patch
+        pos_emb_start_time = time.time()
         num_images = len(views)
         B, _, _ = encoded_feats[0].shape
 
@@ -268,9 +305,14 @@ class Fast3R(nn.Module,
 
         # Repeat the image_ids list B times and reshape it to match the expected shape
         image_ids = torch.tensor(image_ids * B).reshape(B, -1).to(encoded_feats[0].device)
+        if profiling:
+            print(f"pos emb time: {time.time() - pos_emb_start_time}")
 
         # combine all ref images into object-centric representation
+        decoder_start_time = time.time()
         dec_output = self.decoder(encoded_feats, positions, image_ids)
+        if profiling:
+            print(f"decoder time: {time.time() - decoder_start_time}")
 
         ################## Forward pass through the head ##################
         # TODO: optimize this
@@ -278,30 +320,42 @@ class Fast3R(nn.Module,
         # Initialize the final results list
         final_results = [{} for _ in range(num_images)]
 
-        with profiler.record_function("head: gathered outputs"):
-            # Prepare the gathered outputs for each layer
-            gathered_outputs_list = []
-            if different_resolution_across_views:  # If the views have different resolutions, gathered_outputs_list is a list of lists, the outer list is for different views, and the inner list is for different layers
-                for img_id in range(num_images):
-                    gathered_outputs_per_view = []
-                    for layer_output in dec_output:
-                        B, P, D = layer_output.shape
-                        mask = (image_ids == img_id)
-                        gathered_output = layer_output[mask].view(B, -1, D)
-                        gathered_outputs_per_view.append(gathered_output)
-                    gathered_outputs_list.append(gathered_outputs_per_view)
-            else:  # If the views have the same resolution, gathered_outputs_list is a list of tensors, each tensor is for a different layer
-                for layer_output in dec_output:
-                    B, P, D = layer_output.shape
-                    gathered_outputs_per_view = []
-                    for img_id in range(num_images):
-                        mask = (image_ids == img_id)
-                        gathered_output = layer_output[mask].view(B, -1, D)
-                        gathered_outputs_per_view.append(gathered_output)
-                    gathered_outputs_list.append(torch.cat(gathered_outputs_per_view, dim=0))  # fold the view dimension into batch dimension
+        head_prepare_input_start_time = time.time()
+        # Prepare the gathered outputs for each layer
+        if different_resolution_across_views or self.training:
+            # Precompute the number of patches per image
+            num_patches_list = [encoded_feat.shape[1] for encoded_feat in encoded_feats]
 
+            gathered_outputs_list = [[] for _ in range(num_images)]  # List per image
+            for layer_output in dec_output:
+                # layer_output: (B, P_total, D)
+                # Split layer_output along dimension 1 according to num_patches_list
+                split_layer_outputs = torch.split(layer_output, num_patches_list, dim=1)
+                for img_id, gathered_output in enumerate(split_layer_outputs):
+                    # gathered_output: (B, num_patches_list[img_id], D)
+                    gathered_outputs_list[img_id].append(gathered_output)
+        else:
+            # All images have the same number of patches
+            P_patches = encoded_feats[0].shape[1]
+            gathered_outputs_list = []
+            for layer_output in dec_output:
+                # layer_output: (B, num_images * P_patches, D)
+                # Rearrange to (num_images * B, P_patches, D)
+                layer_output = rearrange(
+                    layer_output,
+                    'B (num_images P_patches) D -> (num_images B) P_patches D',
+                    num_images=num_images,
+                    P_patches=P_patches
+                )
+                gathered_outputs_list.append(layer_output)
+
+        if profiling:
+            print(f"head prepare input time: {time.time() - head_prepare_input_start_time}")
+        head_forward_start_time = time.time()
         with profiler.record_function("head: forward pass"):
-            if different_resolution_across_views:
+            if different_resolution_across_views or self.training:
+                # If the views have different resolutions, we cannot batch the views together
+                # or if we are in training mode, we can batch the views together, but we dont want to get OOM so we process them sequentially
                 # Forward pass for each view separately
                 final_results = [{} for _ in range(num_images)]
                 for img_id in range(num_images):
@@ -321,16 +375,45 @@ class Fast3R(nn.Module,
                         final_results[img_id]['pts3d_local'] = local_img_result['pts3d']
                         if 'conf' in local_img_result:
                             final_results[img_id]['conf_local'] = local_img_result['conf']
-            else:
-                # Concatenate shapes
+            else:  # if we are in inference mode and all views have the same resolution, we can batch the views together
                 concatenated_shapes = torch.cat(shapes, dim=0)
 
-                # Forward pass through self.head()
-                result = self.head(gathered_outputs_list, concatenated_shapes)
+                # Split concatenated_shapes into chunks outside the loop
+                shape_chunks = torch.split(concatenated_shapes, self.max_parallel_views_for_head, dim=0)
+                num_chunks = len(shape_chunks)  # Determine number of chunks from shape_chunks
+
+                # Initialize a list to hold chunked gathered outputs
+                chunked_gathered_outputs_list = [[] for _ in range(num_chunks)]
+
+                # Split gathered_outputs_list into chunks
+                for layer_output in gathered_outputs_list:
+                    # Split the layer_output along (num_images * B) dimension
+                    split_layer_outputs = torch.split(layer_output, self.max_parallel_views_for_head, dim=0)
+                    for chunk_idx, split_output in enumerate(split_layer_outputs):
+                        chunked_gathered_outputs_list[chunk_idx].append(split_output)
+
+                # Initialize lists to hold results for each chunk
+                result_chunks = []
+                local_result_chunks = [] if self.local_head else None
+
+                # Process each chunk through self.head and local_head
+                for chunk, chunk_shapes in zip(chunked_gathered_outputs_list, shape_chunks):
+                    # Forward pass for self.head
+                    result_chunk = self.head(chunk, chunk_shapes)
+                    result_chunks.append(result_chunk)
+
+                    # Forward pass for local head if available
+                    if self.local_head:
+                        local_result_chunk = self.local_head(chunk, chunk_shapes)
+                        local_result_chunks.append(local_result_chunk)
+
+                # Reassemble chunks
+                result = {key: torch.cat([chunk[key] for chunk in result_chunks], dim=0) for key in result_chunks[0].keys()}
 
                 if self.local_head:
-                    local_result = self.local_head(gathered_outputs_list, concatenated_shapes)
+                    local_result = {key: torch.cat([chunk[key] for chunk in local_result_chunks], dim=0) for key in local_result_chunks[0].keys()}
 
+                #### Re-map the results from num_images * B tensor to list of B tensors 
                 # Initialize the final results list
                 final_results = [{} for _ in range(num_images)]
 
@@ -349,7 +432,10 @@ class Fast3R(nn.Module,
                             final_results[img_id]['pts3d_local'] = local_img_result
                             if 'conf' in local_result:
                                 final_results[img_id]['conf_local'] = local_result['conf'][img_id * B:(img_id + 1) * B]
-
+        if profiling:
+            print(f"head forward time: {time.time() - head_forward_start_time}")
+        if profiling:
+            print(f"total Fast3R forward time: {time.time() - encode_images_start_time}")
         return final_results
 
 class CroCoEncoder(nn.Module):

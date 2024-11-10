@@ -1,0 +1,9 @@
+defaults:
+  - default
+
+# strategy: deepspeed_stage_2
+strategy: deepspeed_stage_2
+
+accelerator: gpu
+devices: auto
+num_nodes: 1

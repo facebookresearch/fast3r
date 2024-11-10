@@ -3,6 +3,7 @@ import numpy as np
 import re
 import roma
 import torch
+from torch.distributed import all_gather_object, barrier
 from lightning import LightningModule
 from lightning.pytorch.loggers.wandb import WandbLogger
 from torchmetrics import MaxMetric, MeanMetric, MinMetric, SumMetric, Metric
@@ -12,7 +13,7 @@ from src.dust3r.model import FlashDUSt3R
 from src.models.fast3r import Fast3R
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from src.eval.cam_pose_metric import camera_to_rel_deg, calculate_auc
-from src.eval.recon_metric import accuracy, accuracy_fast, completion, completion_fast
+from src.eval.recon_metric import accuracy, accuracy_faiss, completion, completion_faiss
 from src.dust3r.cloud_opt.init_im_poses import fast_pnp
 import open3d as o3d
 import time
@@ -42,6 +43,20 @@ class AccumulatedSum(BaseAggregator):
     def compute(self) -> torch.LongTensor:
         return self.sum_value
 
+def gather_deduplicated_scene_metrics(reconstruction_metrics_per_epoch):
+    """Gathers and deduplicates scene-specific metrics across all ranks by dataset."""
+    gathered_metrics = [None] * torch.distributed.get_world_size()
+    all_gather_object(gathered_metrics, reconstruction_metrics_per_epoch)
+
+    # Flatten and deduplicate metrics across all ranks
+    all_metrics = {}
+    for rank_metrics in gathered_metrics:
+        for dataset_name, scenes in rank_metrics.items():
+            if dataset_name not in all_metrics:
+                all_metrics[dataset_name] = {}
+            all_metrics[dataset_name].update(scenes)  # Keeps the first occurrence of each scene
+
+    return all_metrics
 
 class MultiViewDUSt3RLitModule(LightningModule):
     def __init__(
@@ -88,15 +103,10 @@ class MultiViewDUSt3RLitModule(LightningModule):
         self.val_mAA = MeanMetric()
 
         # Reconstruction evaluation metrics
-        for dataset_name in ['dtu', '7scenes', 'nrgbd']:
-            setattr(self, f'val_recon_{dataset_name}_accuracy', MeanMetric())
-            setattr(self, f'val_recon_{dataset_name}_accuracy_median', MeanMetric())
-            setattr(self, f'val_recon_{dataset_name}_completion', MeanMetric())
-            setattr(self, f'val_recon_{dataset_name}_completion_median', MeanMetric())
-            setattr(self, f'val_recon_{dataset_name}_nc1', MeanMetric())
-            setattr(self, f'val_recon_{dataset_name}_nc1_median', MeanMetric())
-            setattr(self, f'val_recon_{dataset_name}_nc2', MeanMetric())
-            setattr(self, f'val_recon_{dataset_name}_nc2_median', MeanMetric())
+        self.dataset_names_with_samples_of_uneven_num_of_views = ['dtu', '7scenes', 'nrgbd']
+        self.reconstruction_metrics_per_epoch = {}  # Accumulate all reconstruction metrics by dataset and scene for the epoch
+        # New dictionary to store detailed losses for datasets with uneven number of views
+        self.uneven_view_detailed_losses = {}
 
     def forward(self, views: List[Dict[str, torch.Tensor]]) -> Any:
         return self.net(views)
@@ -165,6 +175,19 @@ class MultiViewDUSt3RLitModule(LightningModule):
         self, batch: List[Dict[str, torch.Tensor]], batch_idx: int
     ) -> torch.Tensor:
         views, preds, loss, loss_details = self.model_step(batch, self.train_criterion)
+
+        if not isinstance(loss, (torch.Tensor, dict, type(None))):  # this will cause a lightning.fabric.utilities.exceptions.MisconfigurationException
+            # log loss and the batch information to help debugging
+            # use print instead of log because the logger only logs on rank 0, but this could happen on any rank
+            print(f"Loss is not a tensor or dict but {type(loss)}, value: {loss}")
+            print(f"Loss details: {loss_details}")
+            print(f"Batch: {batch}")
+            print(f"Batch index: {batch_idx}")
+            print(f"Views: {views}")
+            print(f"Preds: {preds}")
+            loss = None  # set loss to None will still break the training loop in DDP, this is intended - we should fix the data to avoid nan loss in the first place
+            return loss
+
         self.epoch_fraction = torch.tensor(self.trainer.current_epoch + batch_idx / self.trainer.num_training_batches, device=self.device)
 
         self.log("trainer/epoch", self.epoch_fraction, on_step=True, on_epoch=False, prog_bar=True)
@@ -198,7 +221,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
         return loss
 
     def validation_step(
-        self, batch: List[Dict[str, torch.Tensor]], batch_idx: int, dataloader_idx: int,
+        self, batch: List[Dict[str, torch.Tensor]], batch_idx: int, dataloader_idx: int = 0,
     ) -> torch.Tensor:
         views, preds, loss, loss_details = self.model_step(batch, self.validation_criterion)
 
@@ -213,22 +236,36 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
         # Log the details of the loss with dataset name and view number in the key
         if loss_details is not None:
-            for key, value in loss_details.items():
-                self.log(
-                    f"val_detail_{dataset_name}_{key}",
-                    value,
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=False,
-                    reduce_fx="mean",
-                    sync_dist=True,
-                    add_dataloader_idx=False,
-                    batch_size=batch_size,
-                )
-                match = re.search(r'/(\d{1,2})$', key)
-                if match:
-                    stripped_key = key[:match.start()]
-                    self.log(f"val/{dataset_name}_{stripped_key}", value, on_step=False, on_epoch=True, prog_bar=False, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+            if dataset_name not in self.dataset_names_with_samples_of_uneven_num_of_views:
+                for key, value in loss_details.items():
+                    self.log(
+                        f"val_detail_{dataset_name}_{key}",
+                        value,
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                        reduce_fx="mean",
+                        sync_dist=True,
+                        add_dataloader_idx=False,
+                        batch_size=batch_size,
+                    )
+                    match = re.search(r'/(\d{1,2})$', key)
+                    if match:
+                        stripped_key = key[:match.start()]
+                        self.log(f"val/{dataset_name}_{stripped_key}", value, on_step=False, on_epoch=True, prog_bar=False, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+            else:
+                # if the dataset name is in self.dataset_names_with_samples_of_uneven_num_of_views, do not use self.val_loss but log it to the holder so that we can use a custom aggregation logic to reduce the loss
+                # this is because the there are different number of views per sample in these datasets, but self.log assumes that all samples have the same number of views,
+                # otherwise self.log will enter a deadlock because it will wait for the same number of samples from all ranks
+
+                # Store in dictionary instead of logging directly
+                for key, value in loss_details.items():
+                    if dataset_name not in self.uneven_view_detailed_losses:
+                        self.uneven_view_detailed_losses[dataset_name] = {}
+                    new_key = f"val_detail_{dataset_name}_{key}"
+                    if new_key not in self.uneven_view_detailed_losses[dataset_name]:
+                        self.uneven_view_detailed_losses[dataset_name][new_key] = []
+                    self.uneven_view_detailed_losses[dataset_name][new_key].append(value)
 
         loss_value = loss.detach().cpu().item()
         del loss, loss_details
@@ -252,33 +289,230 @@ class MultiViewDUSt3RLitModule(LightningModule):
         self.log("val/loss", self.val_loss, prog_bar=True)
 
         # if we dont do these, wandb for some reason cannot display the validation loss with them as the x-axis
-        self.log("trainer/epoch", self.epoch_fraction)
-        self.log("trainer/total_samples", self.train_total_samples)
-        self.log("trainer/total_images", self.train_total_images)
+        self.log("trainer/epoch", self.epoch_fraction, sync_dist=True)
+        self.log("trainer/total_samples", self.train_total_samples.cpu().item(), sync_dist=True)
+        self.log("trainer/total_images", self.train_total_images.cpu().item(), sync_dist=True)
+
+        self.aggregate_and_log_reconstruction_detail_losses()
+
+        # Log the 3D reconstruction metrics
+        self.aggregate_and_log_reconstruction_metrics()
 
     # def test_step(
     #     self, batch: List[Dict[str, torch.Tensor]], batch_idx: int
     # ) -> None:
     #     pass
 
-    def evaluate_reconstruction(self, views, preds, dataset_name, min_conf_thr_percentile=60):
-        # Correct orientation of the predicted points and confidence maps if necessary
-        # self.correct_preds_orientation(preds, views)
+    def aggregate_and_log_reconstruction_detail_losses(self):
+        # log the detailes loss for uneven view datasets
+        # Gather and aggregate detailed losses for uneven-view datasets across all ranks
+        if torch.distributed.is_initialized():
+            gathered_detailed_losses = [None] * torch.distributed.get_world_size()
+            all_gather_object(gathered_detailed_losses, self.uneven_view_detailed_losses)
+
+            # Aggregate gathered data
+            aggregated_losses = {}
+            for rank_losses in gathered_detailed_losses:
+                for dataset_name, loss_dict in rank_losses.items():
+                    if dataset_name not in aggregated_losses:
+                        aggregated_losses[dataset_name] = {}
+                    for key, values in loss_dict.items():
+                        if key not in aggregated_losses[dataset_name]:
+                            aggregated_losses[dataset_name][key] = []
+                        aggregated_losses[dataset_name][key].extend(values)
+
+            # Compute and log the mean of each loss
+            for dataset_name, loss_dict in aggregated_losses.items():
+                for key, values in loss_dict.items():
+                    mean_value = np.mean(values)
+                    self.log(key, mean_value, sync_dist=True)
+
+            # Clear the dictionary after logging
+            self.uneven_view_detailed_losses.clear()
+
+    def aggregate_and_log_reconstruction_metrics(self):
+        # Gather and deduplicate metrics by dataset across all ranks after all batches
+        if torch.distributed.is_initialized():
+            self.reconstruction_metrics_per_epoch = gather_deduplicated_scene_metrics(self.reconstruction_metrics_per_epoch)
+
+        # Log each dataset's scene-specific metric after deduplication
+        for dataset_name, scenes in self.reconstruction_metrics_per_epoch.items():
+            for scene_name, metrics in scenes.items():
+                self.log(f"val_recon_{dataset_name}_detail/{scene_name}/accuracy", metrics["accuracy"], sync_dist=True)
+                self.log(f"val_recon_{dataset_name}_detail/{scene_name}/accuracy_median", metrics["accuracy_median"], sync_dist=True)
+                self.log(f"val_recon_{dataset_name}_detail/{scene_name}/completion", metrics["completion"], sync_dist=True)
+                self.log(f"val_recon_{dataset_name}_detail/{scene_name}/completion_median", metrics["completion_median"], sync_dist=True)
+                self.log(f"val_recon_{dataset_name}_detail/{scene_name}/nc1", metrics["nc1"], sync_dist=True)
+                self.log(f"val_recon_{dataset_name}_detail/{scene_name}/nc1_median", metrics["nc1_median"], sync_dist=True)
+                self.log(f"val_recon_{dataset_name}_detail/{scene_name}/nc2", metrics["nc2"], sync_dist=True)
+                self.log(f"val_recon_{dataset_name}_detail/{scene_name}/nc2_median", metrics["nc2_median"], sync_dist=True)
+
+        # Aggregate global metrics per dataset using deduplicated data
+        for dataset_name, scenes in self.reconstruction_metrics_per_epoch.items():
+            acc_list = [metrics["accuracy"] for metrics in scenes.values()]
+            acc_med_list = [metrics["accuracy_median"] for metrics in scenes.values()]
+            comp_list = [metrics["completion"] for metrics in scenes.values()]
+            comp_med_list = [metrics["completion_median"] for metrics in scenes.values()]
+            nc1_list = [metrics["nc1"] for metrics in scenes.values()]
+            nc1_med_list = [metrics["nc1_median"] for metrics in scenes.values()]
+            nc2_list = [metrics["nc2"] for metrics in scenes.values()]
+            nc2_med_list = [metrics["nc2_median"] for metrics in scenes.values()]
+
+            # Log global aggregated metrics per dataset
+            mean_accuracy = np.mean(acc_list)
+            median_accuracy = np.mean(acc_med_list)
+            mean_completion = np.mean(comp_list)
+            median_completion = np.mean(comp_med_list)
+            mean_nc1 = np.mean(nc1_list)
+            median_nc1 = np.mean(nc1_med_list)
+            mean_nc2 = np.mean(nc2_list)
+            median_nc2 = np.mean(nc2_med_list)
+
+            self.log(f"val_recon_{dataset_name}/accuracy", mean_accuracy, sync_dist=True)
+            self.log(f"val_recon_{dataset_name}/accuracy_median", median_accuracy, sync_dist=True)
+            self.log(f"val_recon_{dataset_name}/completion", mean_completion, sync_dist=True)
+            self.log(f"val_recon_{dataset_name}/completion_median", median_completion, sync_dist=True)
+            self.log(f"val_recon_{dataset_name}/nc1", mean_nc1, sync_dist=True)
+            self.log(f"val_recon_{dataset_name}/nc1_median", median_nc1, sync_dist=True)
+            self.log(f"val_recon_{dataset_name}/nc2", mean_nc2, sync_dist=True)
+            self.log(f"val_recon_{dataset_name}/nc2_median", median_nc2, sync_dist=True)
+
+        # Clear all dataset metrics after logging
+        self.reconstruction_metrics_per_epoch.clear()
+
+    def align_local_pts3d_to_global(self, preds, views, min_conf_thr_percentile=0):
+        """
+        Aligns the local point clouds to the global coordinate frame.
+
+        Args:
+            preds (List[Dict]): A list of dictionaries containing predictions for each view.
+            views (List[Dict]): A list of dictionaries containing ground truth data for each view.
+            min_conf_thr_percentile (float): Minimum confidence percentile threshold (default is 0).
+
+        Modifies:
+            preds: Each pred dictionary in the list will have a new key 'pts3d_local_aligned_to_global',
+                which contains the aligned local points.
+        """
+        # Check if required keys are present in preds
+        for pred in preds:
+            if 'pts3d_local' not in pred:
+                raise ValueError("Key 'pts3d_local' not found in preds.")
+            if 'conf_local' not in pred:
+                raise ValueError("Key 'conf_local' not found in preds.")
+            if 'pts3d_in_other_view' not in pred:
+                raise ValueError("Key 'pts3d_in_other_view' not found in preds.")
+            if 'conf' not in pred:
+                raise ValueError("Key 'conf' (global head confidence) not found in preds.")
+
+        num_views = len(preds)
+        B, H, W, _ = preds[0]['pts3d_local'].shape  # Get batch size and dimensions
+
+        # Function to process a single (view_index, batch_index) pair
+        def process_view_batch(view_index, batch_index):
+            pred = preds[view_index]
+            view = views[view_index]
+
+            # Get the predicted points from local and global heads for this sample
+            pts3d_local = pred['pts3d_local'][batch_index]            # Shape: (H, W, 3)
+            conf_local = pred['conf_local'][batch_index]              # Shape: (H, W)
+            pts3d_global = pred['pts3d_in_other_view'][batch_index]   # Shape: (H, W, 3)
+            conf_global = pred['conf'][batch_index]                   # Shape: (H, W)
+
+            # Get valid_mask if it exists
+            if 'valid_mask' in view:
+                valid_mask = view['valid_mask'][batch_index]          # Shape: (H, W)
+            else:
+                valid_mask = torch.ones_like(conf_global, dtype=torch.bool)
+
+            # Flatten the confidences to compute the threshold
+            conf_global_flat = conf_global.view(-1)  # Shape: (N,)
+
+            # Compute the confidence threshold
+            conf_threshold_value = torch.quantile(conf_global_flat, min_conf_thr_percentile / 100.0)
+
+            # Create a mask for high-confidence points
+            conf_mask = conf_global >= conf_threshold_value
+
+            # Combine masks
+            final_mask = conf_mask & valid_mask  # Shape: (H, W)
+
+            # Flatten the points and masks
+            pts_local_flat = pts3d_local.view(-1, 3)   # Shape: (N, 3)
+            pts_global_flat = pts3d_global.view(-1, 3) # Shape: (N, 3)
+            final_mask_flat = final_mask.view(-1)      # Shape: (N,)
+
+            # Select valid points
+            x = pts_local_flat[final_mask_flat]    # Local points (M, 3)
+            y = pts_global_flat[final_mask_flat]   # Global points (M, 3)
+            # w = conf_global.view(-1)[final_mask_flat]  # Weights (M,)
+
+            # Check if we have enough points after applying confidence threshold
+            if x.shape[0] < 3:
+                # Not enough points after applying confidence threshold
+                # Use only valid_mask
+                final_mask = valid_mask
+                final_mask_flat = final_mask.view(-1)
+
+                # Re-select points without confidence threshold
+                x = pts_local_flat[final_mask_flat]    # Local points (M, 3)
+                y = pts_global_flat[final_mask_flat]   # Global points (M, 3)
+                # w = conf_global.view(-1)[final_mask_flat]  # Weights (M,)
+
+            # Check again if we have enough points
+            if x.shape[0] < 3:
+                # Not enough points even after using valid_mask only
+                # Use identity transformation
+                R = torch.eye(3, device=pts_local_flat.device, dtype=pts_local_flat.dtype)
+                t = torch.zeros(3, device=pts_local_flat.device, dtype=pts_local_flat.dtype)
+                s = 1.0
+            else:
+                # Compute the rigid transformation with scaling
+                R, t, s = roma.rigid_points_registration(
+                    x, y, compute_scaling=True
+                )
+
+            # Apply the transformation to all local points (including invalid ones)
+            pts_local_aligned_flat = s * (pts_local_flat @ R.T) + t  # Shape: (N, 3)
+
+            # Reshape back to (H, W, 3)
+            pts_local_aligned = pts_local_aligned_flat.view(H, W, 3)
+
+            return (view_index, batch_index, pts_local_aligned)
+
+        # Create a list of all tasks (view_index, batch_index) pairs
+        tasks = [(view_idx, batch_idx) for view_idx in range(num_views) for batch_idx in range(B)]
+
+        # Use ThreadPoolExecutor to parallelize across tasks
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(process_view_batch, view_idx, batch_idx) for view_idx, batch_idx in tasks]
+
+            # Collect the results
+            results = [future.result() for future in futures]
+
+        # Organize the results and update preds
+        # Create a dictionary to store aligned points for each view
+        aligned_pts_dict = {view_idx: [None] * B for view_idx in range(num_views)}
+
+        for view_index, batch_index, pts_local_aligned in results:
+            aligned_pts_dict[view_index][batch_index] = pts_local_aligned
+
+        # Update preds with the aligned points
+        for view_index in range(num_views):
+            pred = preds[view_index]
+            # Stack the aligned points back into a tensor of shape (B, H, W, 3)
+            pred['pts3d_local_aligned_to_global'] = torch.stack(aligned_pts_dict[view_index], dim=0)
+
+    def evaluate_reconstruction(self, views, preds, dataset_name, min_conf_thr_percentile=0, use_pts3d_from_local_head=True):
+        # align the local head output to the global output
+        # and populate the preds with "pts3d_local_aligned_to_global"
+        if use_pts3d_from_local_head:
+            self.align_local_pts3d_to_global(preds, views, min_conf_thr_percentile)
 
         batch_size = len(views[0]['img'])  # Assuming batch_size is consistent
 
-        # Initialize lists to collect per-sample metrics
-        acc_list = []
-        acc_med_list = []
-        comp_list = []
-        comp_med_list = []
-        nc1_list = []
-        nc1_med_list = []
-        nc2_list = []
-        nc2_med_list = []
-
         # Define the function to process a single sample
         def process_sample(i):
+            scene_name = "/".join(views[i]['label'][0].split('/')[:-1]) if "label" in views[i] else "unknown"
             pred_pts_list = []
             gt_pts_list_icp = []
             gt_pts_list_metrics = []
@@ -289,12 +523,8 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
             for j, (view, pred) in enumerate(zip(views, preds)):
                 # Extract predicted points and confidence
-                pts_pred = pred['pts3d_in_other_view'][i]  # Shape: (H, W, 3)
-                conf = pred['conf'][i]  # Shape: (H, W)
-
-                ########### Debug: use GT point map to estimate poses
-                # pts_gt = view['pts3d'][i]  # Shape: (H, W, 3)
-                ########### End Debug
+                pts_pred = pred['pts3d_local_aligned_to_global'][i] if use_pts3d_from_local_head else pred['pts3d_in_other_view'][i]  # Shape: (H, W, 3)
+                conf = pred['conf_local'][i] if use_pts3d_from_local_head else pred['conf'][i]  # Shape: (H, W)
 
                 # Extract GT points
                 pts_gt = view['pts3d'][i]  # Shape: (H, W, 3)
@@ -343,7 +573,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
             if len(pred_pts_list) == 0 or len(gt_pts_list_metrics) == 0:
                 # If no valid points, return default metrics
                 print(f"Sample {i}: No valid points found.")
-                return 0, 0, 0, 0, 0, 0, 0, 0
+                return None, None, None, None, None, None, None, None
 
             pred_pts_all = torch.cat(pred_pts_list, dim=0)           # Shape: (N_pred, 3)
             gt_pts_all_icp = torch.cat(gt_pts_list_icp, dim=0)       # Shape: (N_pred, 3)
@@ -362,9 +592,9 @@ class MultiViewDUSt3RLitModule(LightningModule):
             conf_tensor = conf_all.cpu()                  # Shape: (N_pred,)
             weights = weights_all.cpu()                   # Shape: (N_pred,)
 
-            print(f"Sample {i}: Number of high-confidence predicted points: {pred_pts_tensor.shape[0]}")
-            print(f"Sample {i}: Number of GT points for ICP: {gt_pts_tensor_icp.shape[0]}")
-            print(f"Sample {i}: Number of GT points for metrics: {gt_pts_tensor_metrics.shape[0]}")
+            # print(f"Sample {i}: Number of high-confidence predicted points: {pred_pts_tensor.shape[0]}")
+            # print(f"Sample {i}: Number of GT points for ICP: {gt_pts_tensor_icp.shape[0]}")
+            # print(f"Sample {i}: Number of GT points for metrics: {gt_pts_tensor_metrics.shape[0]}")
 
             # Align predicted points to GT using roma.rigid_points_registration with weights
             start_time = time.time()
@@ -377,7 +607,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
             R, t, s = roma.rigid_points_registration(x, y, weights=weights, compute_scaling=True)
 
             alignment_time = time.time() - start_time
-            print(f"Alignment time using roma with weights for sample {i}: {alignment_time:.4f} seconds")
+            # print(f"Alignment time using roma with weights for sample {i}: {alignment_time:.4f} seconds")
 
             # Apply the transformation to the predicted points
             pred_aligned = s * (x @ R.T) + t  # Shape: (N_pred, 3)
@@ -398,7 +628,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
             gt_pcd.colors = o3d.utility.Vector3dVector(colors_gt_tensor.numpy())
             gt_pcd.estimate_normals()
             normals_time = time.time() - start_time
-            print(f"Normal estimation time for sample {i}: {normals_time:.4f} seconds")
+            # print(f"Normal estimation time for sample {i}: {normals_time:.4f} seconds")
 
             # Get normals
             pred_normals = np.asarray(pred_pcd.normals)
@@ -410,73 +640,45 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
             # Save the GT and predicted point clouds (separately) for visualization
             # Define file paths
-            gt_pcd_path = f"gt_pcd_sample_{i}.ply"
-            pred_pcd_path = f"pred_pcd_sample_{i}.ply"
-            # Save the GT point cloud
-            o3d.io.write_point_cloud(gt_pcd_path, gt_pcd)
-            # Save the predicted point cloud
-            o3d.io.write_point_cloud(pred_pcd_path, pred_pcd)
+            # gt_pcd_path = f"gt_pcd_sample_{i}.ply"
+            # pred_pcd_path = f"pred_pcd_sample_{i}.ply"
+            # # Save the GT point cloud
+            # o3d.io.write_point_cloud(gt_pcd_path, gt_pcd)
+            # # Save the predicted point cloud
+            # o3d.io.write_point_cloud(pred_pcd_path, pred_pcd)
 
             # Compute metrics
             start_time = time.time()
             acc, acc_med, nc1, nc1_med = accuracy(
-                gt_points_np, pred_points_np, gt_normals, pred_normals
+                gt_points_np, pred_points_np, gt_normals, pred_normals, device=views[i]['pts3d'].device
             )
             comp, comp_med, nc2, nc2_med = completion(
-                gt_points_np, pred_points_np, gt_normals, pred_normals
+                gt_points_np, pred_points_np, gt_normals, pred_normals, device=views[i]['pts3d'].device
             )
             metrics_time = time.time() - start_time
-            print(f"Metrics computation time for sample {i}: {metrics_time:.4f} seconds")
-            print(f"Accuracy: {acc:.4f}, Accuracy median: {acc_med:.4f}")
-            print(f"Completion: {comp:.4f}, Completion median: {comp_med:.4f}")
-            print(f"Normal consistency 1: {nc1:.4f}, Normal consistency 1 median: {nc1_med:.4f}")
-            print(f"Normal consistency 2: {nc2:.4f}, Normal consistency 2 median: {nc2_med:.4f}")
+            print(f"Metrics computation time for sample {i}: {metrics_time:.4f} seconds. scene_name: {scene_name}")
+            print(f"Accuracy: {acc:.4f}, Accuracy median: {acc_med:.4f}. scene_name: {scene_name}")
+            print(f"Completion: {comp:.4f}, Completion median: {comp_med:.4f}. scene_name: {scene_name}")
+            print(f"Normal consistency 1: {nc1:.4f}, Normal consistency 1 median: {nc1_med:.4f}. scene_name: {scene_name}")
+            print(f"Normal consistency 2: {nc2:.4f}, Normal consistency 2 median: {nc2_med:.4f}. scene_name: {scene_name}")
 
-            # Return metrics
-            return acc, acc_med, comp, comp_med, nc1, nc1_med, nc2, nc2_med
+            # Collect metrics for the scene and return as a dictionary
+            return {scene_name: {
+                "accuracy": acc, "accuracy_median": acc_med,
+                "completion": comp, "completion_median": comp_med,
+                "nc1": nc1, "nc1_median": nc1_med,
+                "nc2": nc2, "nc2_median": nc2_med,
+            }}
 
-        # Use ThreadPoolExecutor to parallelize across samples
+        # Use ThreadPoolExecutor to parallelize across samples and gather results
         with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(process_sample, i) for i in range(batch_size)]
-            for future in futures:
-                acc, acc_med, comp, comp_med, nc1, nc1_med, nc2, nc2_med = future.result()
-                # Collect metrics
-                acc_list.append(acc)
-                acc_med_list.append(acc_med)
-                comp_list.append(comp)
-                comp_med_list.append(comp_med)
-                nc1_list.append(nc1)
-                nc1_med_list.append(nc1_med)
-                nc2_list.append(nc2)
-                nc2_med_list.append(nc2_med)
+            results = [future.result() for future in [executor.submit(process_sample, i) for i in range(batch_size)]]
 
-        # After processing all samples in batch, compute mean and median metrics
-        mean_accuracy = np.mean(acc_list)
-        median_accuracy = np.median(acc_list)
-        mean_completion = np.mean(comp_list)
-        median_completion = np.median(comp_list)
-        mean_nc1 = np.mean(nc1_list)
-        median_nc1 = np.median(nc1_list)
-        mean_nc2 = np.mean(nc2_list)
-        median_nc2 = np.median(nc2_list)
-
-        # Update and log metrics
-        getattr(self, f'val_recon_{dataset_name}_accuracy')(mean_accuracy)
-        self.log(f"val_recon_{dataset_name}/accuracy", getattr(self, f'val_recon_{dataset_name}_accuracy'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
-        getattr(self, f'val_recon_{dataset_name}_accuracy_median')(median_accuracy)
-        self.log(f"val_recon_{dataset_name}/accuracy_median", getattr(self, f'val_recon_{dataset_name}_accuracy_median'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
-        getattr(self, f'val_recon_{dataset_name}_completion')(mean_completion)
-        self.log(f"val_recon_{dataset_name}/completion", getattr(self, f'val_recon_{dataset_name}_completion'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
-        getattr(self, f'val_recon_{dataset_name}_completion_median')(median_completion)
-        self.log(f"val_recon_{dataset_name}/completion_median", getattr(self, f'val_recon_{dataset_name}_completion_median'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
-        getattr(self, f'val_recon_{dataset_name}_nc1')(mean_nc1)
-        self.log(f"val_recon_{dataset_name}/nc1", getattr(self, f'val_recon_{dataset_name}_nc1'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
-        getattr(self, f'val_recon_{dataset_name}_nc1_median')(median_nc1)
-        self.log(f"val_recon_{dataset_name}/nc1_median", getattr(self, f'val_recon_{dataset_name}_nc1_median'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
-        getattr(self, f'val_recon_{dataset_name}_nc2')(mean_nc2)
-        self.log(f"val_recon_{dataset_name}/nc2", getattr(self, f'val_recon_{dataset_name}_nc2'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
-        getattr(self, f'val_recon_{dataset_name}_nc2_median')(median_nc2)
-        self.log(f"val_recon_{dataset_name}/nc2_median", getattr(self, f'val_recon_{dataset_name}_nc2_median'), on_step=False, on_epoch=True, prog_bar=True, reduce_fx="mean", sync_dist=True, add_dataloader_idx=False, batch_size=batch_size)
+        # Aggregate results from all processed samples into epoch metrics by dataset and scene
+        for result in results:
+            if dataset_name not in self.reconstruction_metrics_per_epoch:
+                self.reconstruction_metrics_per_epoch[dataset_name] = {}
+            self.reconstruction_metrics_per_epoch[dataset_name].update(result)  # Accumulate per dataset for the epoch
 
     def evaluate_camera_poses(self, views, preds, estimate_focal_from_first_view=False):
         """Evaluate camera poses and focal lengths using fast_pnp in parallel."""

@@ -1,3 +1,5 @@
+notebooks/output/
+
 *.ply
 
 # Byte-compiled / optimized / DLL files

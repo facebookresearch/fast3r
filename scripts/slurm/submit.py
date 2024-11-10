@@ -37,7 +37,7 @@ def main():
 #SBATCH --mail-user=jianingy@meta.com
 #SBATCH --mail-type=BEGIN,END
 #SBATCH --account=cortex
-#SBATCH --qos=cortex_high
+#SBATCH --qos=cortex
 #SBATCH --nodes={nodes}
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96
@@ -62,6 +62,7 @@ cd /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/
 
 # Debugging flags (optional)
 export NCCL_DEBUG=INFO
+# export NCCL_DEBUG_SUBSYS=ALL
 export PYTHONFAULTHANDLER=1
 export TORCH_DISTRIBUTED_DEBUG=INFO
 
