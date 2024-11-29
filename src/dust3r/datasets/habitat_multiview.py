@@ -10,15 +10,22 @@ import random
 from src.dust3r.datasets.base.base_stereo_view_dataset import BaseStereoViewDataset
 
 class Habitat_Multiview(BaseStereoViewDataset):
-    def __init__(self, size=1_000_000, num_views=4, *args, ROOT, **kwargs):
+    def __init__(self, size=1_000_000, num_views=4, data_scaling=1.0, *args, ROOT, **kwargs):
         super().__init__(*args, **kwargs)
         self.ROOT = ROOT
         self.num_views = num_views
+        self.data_scaling = data_scaling
 
         assert self.split is not None
         # Loading list of scenes
         with open(osp.join(self.ROOT, f'Habitat_{size}_scenes_{self.split}.txt')) as f:
             self.scenes = f.read().splitlines()
+
+        # Apply data scaling to limit the number of scenes
+        if self.data_scaling < 1.0:
+            num_scenes = max(1, int(len(self.scenes) * self.data_scaling))
+            self.scenes = sorted(self.scenes)[:num_scenes]
+
         self.instances = list(range(1, 5))  # Instance views other than view 0
 
     def filter_scene(self, label, instance=None):

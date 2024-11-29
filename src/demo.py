@@ -33,7 +33,7 @@ from src.dust3r.viz import CAM_COLORS, OPENGL, add_scene_cam, cat_meshes, pts3d_
 pl.ion()
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
-batch_size = 1
+batch_size = 150
 
 
 def get_args_parser():

@@ -13,9 +13,9 @@ trainer:
 data:
   num_views: 30
   num_views_val: 10
-  num_workers: 6
-  pin_memory: true
   data_module:
+    num_workers: 6
+    pin_memory: true
     batch_size_per_device: 1
     batch_size_per_device_val: 2
     train_datasets:

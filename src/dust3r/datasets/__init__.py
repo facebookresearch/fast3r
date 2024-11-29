@@ -19,7 +19,7 @@ from .waymo import Waymo  # noqa
 from .wildrgbd import WildRGBD  # noqa
 from src.data.components.spann3r_datasets import *  # noqa
 
-def get_data_loader(dataset, batch_size, num_workers=8, shuffle=True, drop_last=True, pin_mem=True):
+def get_data_loader(dataset, batch_size, num_workers=8, shuffle=True, drop_last=True, pin_mem=True, persistent_workers=False, multiprocessing_context=None):
     import torch
     from croco.utils.misc import get_world_size, get_rank
 
@@ -51,6 +51,8 @@ def get_data_loader(dataset, batch_size, num_workers=8, shuffle=True, drop_last=
         num_workers=num_workers,
         pin_memory=pin_mem,
         drop_last=drop_last,
+        persistent_workers=persistent_workers,
+        multiprocessing_context=multiprocessing_context,
     )
 
     return data_loader

@@ -7,13 +7,14 @@ from src.dust3r.datasets.base.base_stereo_view_dataset import BaseStereoViewData
 from src.dust3r.utils.image import imread_cv2
 
 class ScanNetpp_Multiview(BaseStereoViewDataset):
-    def __init__(self, num_views=4, window_size=60, num_samples_per_window=100, ordered=False, *args, ROOT, **kwargs):
+    def __init__(self, num_views=4, window_size=60, num_samples_per_window=100, ordered=False, data_scaling=1.0, *args, ROOT, **kwargs):
         super().__init__(*args, **kwargs)
         self.ROOT = ROOT
         self.num_views = num_views
         self.window_size = window_size
         self.num_samples_per_window = num_samples_per_window
         self.ordered = ordered
+        self.data_scaling = data_scaling
         assert self.split == 'train'
         self.loaded_data = self._load_data()
         self._generate_combinations()
@@ -43,6 +44,14 @@ class ScanNetpp_Multiview(BaseStereoViewDataset):
                 self.scene_to_indices[scene_id]['iphone'].append(idx)
             else:  # DSLR pattern
                 self.scene_to_indices[scene_id]['dslr'].append(idx)
+
+        # Apply data scaling to control the number of scenes used
+        if self.data_scaling < 1.0:
+            num_scenes = max(1, int(len(self.scene_to_indices) * self.data_scaling))
+            sorted_scene_ids = sorted(self.scene_to_indices.keys())
+            selected_scene_ids = sorted_scene_ids[:num_scenes]
+            # Keep only the selected scenes
+            self.scene_to_indices = {scene_id: self.scene_to_indices[scene_id] for scene_id in selected_scene_ids}
 
         # Sort indices in temporal order within each scene's iPhone and DSLR list
         for scene_dict in self.scene_to_indices.values():

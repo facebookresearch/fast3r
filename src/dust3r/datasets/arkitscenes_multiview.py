@@ -8,13 +8,14 @@ from src.dust3r.utils.image import imread_cv2
 from tqdm import tqdm
 
 class ARKitScenes_Multiview(BaseStereoViewDataset):
-    def __init__(self, num_views=4, window_size=6, num_samples_per_window=10, ordered=False, *args, split, ROOT, **kwargs):
+    def __init__(self, num_views=4, window_size=6, num_samples_per_window=10, ordered=False, data_scaling=1.0, *args, split, ROOT, **kwargs):
         super().__init__(*args, **kwargs)
         self.ROOT = ROOT
         self.num_views = num_views
         self.num_samples_per_window = num_samples_per_window
         self.window_size = window_size
         self.ordered = ordered
+        self.data_scaling = data_scaling
 
         if split == "train":
             self.split = "Training"
@@ -46,6 +47,14 @@ class ARKitScenes_Multiview(BaseStereoViewDataset):
             if scene_id not in scene_to_indices:
                 scene_to_indices[scene_id] = []
             scene_to_indices[scene_id].append(idx)
+
+        # Apply data scaling to control the number of scenes used
+        if self.data_scaling < 1.0:
+            num_scenes = max(1, int(len(scene_to_indices) * self.data_scaling))
+            sorted_scene_ids = sorted(scene_to_indices.keys())
+            selected_scene_ids = sorted_scene_ids[:num_scenes]
+            # Keep only the selected scenes
+            scene_to_indices = {scene_id: scene_to_indices[scene_id] for scene_id in selected_scene_ids}
 
         # Sort each scene's indices by temporal order based on image names
         for scene_id, indices in scene_to_indices.items():

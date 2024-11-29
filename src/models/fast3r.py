@@ -185,23 +185,27 @@ class Fast3R(nn.Module,
         # Load the downstream head part into the model with try-catch logic
         # Save the original downstream head state to restore in case of failure
         downstream_head_original_state = {k: v.clone() for k, v in self.downstream_head.state_dict().items()}
-        try:
-            load_result = self.load_state_dict(downstream_head_state_dict, strict=False)
 
-            # Remove keys that failed to load
-            missing_keys = set(load_result.missing_keys)
-            unexpected_keys = set(load_result.unexpected_keys)
-            loaded_keys -= (missing_keys | unexpected_keys)
-        except RuntimeError as e:
-            log.warning(f"Error loading downstream head: {str(e)}")
-            log.warning("Reverting downstream head to its original state")
-            # Revert downstream head to its original state
-            self.downstream_head.load_state_dict(downstream_head_original_state)
+        if not self.head_args.get('skip_load_pretrained_head', False):
+            try:
+                load_result = self.load_state_dict(downstream_head_state_dict, strict=False)
 
-            del downstream_head_original_state
+                # Remove keys that failed to load
+                missing_keys = set(load_result.missing_keys)
+                unexpected_keys = set(load_result.unexpected_keys)
+                loaded_keys -= (missing_keys | unexpected_keys)
+            except RuntimeError as e:
+                log.warning(f"Error loading downstream head: {str(e)}")
+                log.warning("Reverting downstream head to its original state")
+                # Revert downstream head to its original state
+                self.downstream_head.load_state_dict(downstream_head_original_state)
 
-            # Remove downstream head keys from loaded_keys, as they were not loaded
-            loaded_keys -= set([key for key in checkpoint.keys() if key.startswith("downstream_head1")])
+                del downstream_head_original_state
+
+                # Remove downstream head keys from loaded_keys, as they were not loaded
+                loaded_keys -= set([key for key in checkpoint.keys() if key.startswith("downstream_head1")])
+        else:
+            log.info("Skipping loading pretrained head")
 
         # Compute not loaded keys as difference between all checkpoint keys and loaded keys
         checkpoint_keys = set(checkpoint.keys())
@@ -309,9 +313,12 @@ class Fast3R(nn.Module,
             print(f"pos emb time: {time.time() - pos_emb_start_time}")
 
         # combine all ref images into object-centric representation
-        decoder_start_time = time.time()
+        if profiling:
+            torch.cuda.synchronize()
+            decoder_start_time = time.time()
         dec_output = self.decoder(encoded_feats, positions, image_ids)
         if profiling:
+            torch.cuda.synchronize()
             print(f"decoder time: {time.time() - decoder_start_time}")
 
         ################## Forward pass through the head ##################
@@ -413,7 +420,7 @@ class Fast3R(nn.Module,
                 if self.local_head:
                     local_result = {key: torch.cat([chunk[key] for chunk in local_result_chunks], dim=0) for key in local_result_chunks[0].keys()}
 
-                #### Re-map the results from num_images * B tensor to list of B tensors 
+                #### Re-map the results from num_images * B tensor to list of B tensors
                 # Initialize the final results list
                 final_results = [{} for _ in range(num_images)]
 

@@ -67,7 +67,7 @@ def _resize_pil_image(img, long_edge_size):
     return img.resize(new_size, interp)
 
 
-def load_images(folder_or_list, size, square_ok=False, verbose=True):
+def load_images(folder_or_list, size, square_ok=False, verbose=True, rotate_clockwise_90_for_hyperscape=False, crop_to_landscape_for_hyperscape=False):
     """open and convert all images in a list or folder to proper input format for DUSt3R"""
     if isinstance(folder_or_list, str):
         if verbose:
@@ -92,6 +92,31 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True):
         if not path.lower().endswith(supported_images_extensions):
             continue
         img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert("RGB")
+        if rotate_clockwise_90_for_hyperscape:
+            img = img.rotate(-90, expand=True)
+        if crop_to_landscape_for_hyperscape:
+            # Crop to a landscape aspect ratio (e.g., 16:9)
+            desired_aspect_ratio = 4 / 3
+            width, height = img.size
+            current_aspect_ratio = width / height
+
+            if current_aspect_ratio > desired_aspect_ratio:
+                # Wider than landscape: crop width
+                new_width = int(height * desired_aspect_ratio)
+                left = (width - new_width) // 2
+                right = left + new_width
+                top = 0
+                bottom = height
+            else:
+                # Taller than landscape: crop height
+                new_height = int(width / desired_aspect_ratio)
+                top = (height - new_height) // 2
+                bottom = top + new_height
+                left = 0
+                right = width
+
+            img = img.crop((left, top, right, bottom))
+
         W1, H1 = img.size
         if size == 224:
             # resize short side to 224 (then crop)

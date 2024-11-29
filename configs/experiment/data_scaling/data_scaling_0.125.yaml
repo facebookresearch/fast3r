@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - data_scaling/default
+
+task_name: data_scaling_0.125
+
+data:
+  data_scaling: 0.125
+
+ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/data_scaling_0.125/runs/data_scaling_0.125_4995746/checkpoints/last.ckpt

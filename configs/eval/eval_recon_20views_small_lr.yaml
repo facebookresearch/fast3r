@@ -21,9 +21,9 @@ data:
   data_module:
     validation_datasets:
       - 100 @ Co3d_Multiview(split='test', num_views=${data.num_views_val}, window_degree_range=360, num_samples_per_window=100, ROOT='${data.data_root}/co3d_50_seqs_per_category_subset_processed', resolution=(512, 384), seed=777)
-      - DTU(split='test', ROOT='${data.data_root}/dtu_test_mvsnet_release', resolution=(512, 384), num_seq=1, full_video=True, kf_every=5)
-      - SevenScenes(split='test', ROOT='${data.data_root}/7_scenes_processed', resolution=(512, 384), num_seq=1, full_video=True, kf_every=20)
-      - NRGBD(split='test', ROOT='${data.data_root}/neural_rgbd', resolution=(512, 384), num_seq=1, full_video=True, kf_every=40)
+      - DTU(split='test', ROOT='${data.data_root}/dtu_test_mvsnet_release', resolution=512, num_seq=1, full_video=True, kf_every=5)
+      - SevenScenes(split='test', ROOT='${data.data_root}/7_scenes_processed', resolution=512, num_seq=1, full_video=True, kf_every=20)
+      - NRGBD(split='test', ROOT='${data.data_root}/neural_rgbd', resolution=512, num_seq=1, full_video=True, kf_every=40)
     num_workers: 0 # debuggers don't like multiprocessing
     pin_memory: true # disable gpu memory pin
     batch_size_per_device: 6

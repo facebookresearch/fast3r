@@ -11,12 +11,13 @@ from src.dust3r.datasets.base.base_stereo_view_dataset import BaseStereoViewData
 from src.dust3r.utils.image import imread_cv2
 
 class Co3d_Multiview(BaseStereoViewDataset):
-    def __init__(self, num_views=4, window_degree_range=360, num_samples_per_window=100, mask_bg=True, *args, ROOT, **kwargs):
+    def __init__(self, num_views=4, window_degree_range=360, num_samples_per_window=100, data_scaling=1.0, mask_bg=True, *args, ROOT, **kwargs):
         super().__init__(*args, **kwargs)
         self.ROOT = ROOT
         self.num_views = num_views
         self.window_degree_range = window_degree_range
         self.num_samples_per_window = num_samples_per_window
+        self.data_scaling = data_scaling
         assert mask_bg in (True, False, "rand")
         self.mask_bg = mask_bg
         self.invalid_scene_tracker = set()  # Track scenes that have all images invalid
@@ -25,6 +26,13 @@ class Co3d_Multiview(BaseStereoViewDataset):
         with open(osp.join(self.ROOT, f"selected_seqs_{self.split}.json"), "r") as f:
             self.scenes = json.load(f)
             self.scenes = {k: v for k, v in self.scenes.items() if len(v) > 0}
+            # TODO: cap to use only a subset of the scenes based on the data_scaling
+            if self.data_scaling < 1.0:
+                for obj in self.scenes.keys():
+                    trajectories = self.scenes[obj]
+                    num_trajectories = max(1, int(len(trajectories) * self.data_scaling))  # Ensure at least 1 trajectory
+                    selected_trajectories = dict(list(trajectories.items())[:num_trajectories])  # Select a subset
+                    self.scenes[obj] = selected_trajectories
             self.scenes = {
                 (k, k2): v2 for k, v in self.scenes.items() for k2, v2 in v.items()
             }
@@ -61,7 +69,7 @@ class Co3d_Multiview(BaseStereoViewDataset):
     def _fetch_views_for_pool(self, obj, instance, image_pool, resolution, rng):
         """Attempt to get valid views from a single image_pool, with oversampling if needed."""
         last = len(image_pool) - 1
-        imgs_idxs = deque([max(0, min(im_idx + rng.integers(-4, 5), last)) for im_idx in self.combinations[0]])
+        imgs_idxs = deque([max(0, min(im_idx + rng.integers(-4, 5), last)) for im_idx in self.combinations[0]])  # add some randomness for each data point
 
         # Collect views and track validity
         views = []

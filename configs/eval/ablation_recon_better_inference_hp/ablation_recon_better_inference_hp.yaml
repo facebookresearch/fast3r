@@ -1,0 +1,45 @@
+# @package _global_
+
+# seed for random number generators in pytorch, numpy and python.random
+seed: 42
+
+
+tags: ["eval", "ablation_recon_better_inference_hp"]
+
+# ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/fast3r_local_head_better_scannetpp_and_arkit_pretrained_20views_small_lr/runs/fast3r_local_head_better_scannetpp_and_arkit_pretrained_20views_small_lr_4804512/checkpoints/last.ckpt
+# ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/more_co3d_finetune_16views/runs/more_co3d_finetune_16views_4865625/checkpoints/last.ckpt
+ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/more_co3d_finetune_20views/runs/more_co3d_finetune_20views_4867088/checkpoints/last.ckpt
+
+task_name_model_name: more_co3d_finetune_20views_4867088
+task_name: ablation_recon_better_inference_hp_${task_name_model_name}
+
+slurm_job_id: ??? # must set in the command line
+
+paths:
+  run_folder_name: ${task_name}_${slurm_job_id}
+
+
+logger:
+  wandb:
+    name: ${task_name}_${slurm_job_id}
+
+
+data:
+  num_views: 0 # do not use this field
+  num_views_val: 10 # must set in the inheriting config
+  data_module:
+    train_datasets: [] # do not initialize any datasets for training
+    validation_datasets:
+      - 100 @ Co3d_Multiview(split='test', num_views=${data.num_views_val}, window_degree_range=360, num_samples_per_window=100, ROOT='${data.data_root}/co3d_50_seqs_per_category_subset_processed', resolution=(512, 384), seed=777)
+      - DTU(split='test', ROOT='${data.data_root}/dtu_test_mvsnet_release', resolution=512, num_seq=1, full_video=True, kf_every=5)
+      - SevenScenes(split='test', ROOT='${data.data_root}/7_scenes_processed', resolution=512, num_seq=1, full_video=True, kf_every=20)
+      - NRGBD(split='test', ROOT='${data.data_root}/neural_rgbd', resolution=512, num_seq=1, full_video=True, kf_every=40)
+    num_workers_val: 0
+    pin_memory: true
+    batch_size_per_device_val: 1
+
+trainer:
+  log_every_n_steps: 1
+  devices: auto
+  limit_train_batches: 0
+  limit_val_batches: 10000

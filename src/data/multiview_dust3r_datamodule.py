@@ -7,6 +7,7 @@ from src.dust3r.datasets import get_data_loader
 from src.dust3r.datasets import *
 from src.data.components.spann3r_datasets import *
 from src.dust3r.datasets.base.easy_dataset import ResizedDataset
+from lightning.pytorch.strategies.deepspeed import DeepSpeedStrategy
 
 class MultiViewDUSt3RDataModule(LightningDataModule):
     """LightningDataModule for the custom dataset.
@@ -47,6 +48,7 @@ class MultiViewDUSt3RDataModule(LightningDataModule):
         batch_size_per_device: int = 64,
         batch_size_per_device_val: int = 64,
         num_workers: int = 12,
+        num_workers_val: int = 2,
         pin_memory: bool = True,
     ) -> None:
         """Initialize a CustomDataModule.
@@ -64,6 +66,7 @@ class MultiViewDUSt3RDataModule(LightningDataModule):
         self.batch_size_per_device = batch_size_per_device
         self.batch_size_per_device_val = batch_size_per_device_val
         self.num_workers = num_workers
+        self.num_workers_val = num_workers_val
         self.pin_memory = pin_memory
 
         # this line allows to access init params with 'self.hparams' attribute
@@ -104,6 +107,8 @@ class MultiViewDUSt3RDataModule(LightningDataModule):
             pin_mem=self.pin_memory,
             shuffle=True,
             drop_last=True,
+            multiprocessing_context="spawn" if isinstance(self.trainer.strategy, DeepSpeedStrategy) else None,  # for DeepSpeed ZeRO-2, for some reason the default fork context doesn't work - it would cause a "cannot allocate memory" error 
+            persistent_workers=True if self.num_workers_val > 0 else False,
         )
 
         # Set epoch for train and validation loaders (if applicable)
@@ -129,14 +134,21 @@ class MultiViewDUSt3RDataModule(LightningDataModule):
         for dataset in val_datasets:
             dataset.set_ratio(1.0)  # FIXME: Check if this is correct # the spann3r datasets have a set_ratio method
 
+            if isinstance(dataset, (DTU, SevenScenes, NRGBD)):
+                batch_size = 1
+            else:
+                batch_size = self.batch_size_per_device_val
+
             val_loaders.append(
                 get_data_loader(
                     dataset,
-                    batch_size=self.batch_size_per_device_val,
-                    num_workers=self.num_workers,
+                    batch_size=batch_size,
+                    num_workers=self.num_workers_val,
                     pin_mem=self.pin_memory,
                     shuffle=False,
                     drop_last=False,  # set to False if you want to keep the last batch, e.g., for precise evaluation
+                    multiprocessing_context="spawn" if isinstance(self.trainer.strategy, DeepSpeedStrategy) else None,  # for DeepSpeed ZeRO-2, for some reason the default fork context doesn't work - it would cause a "cannot allocate memory" error
+                    persistent_workers=True if self.num_workers_val > 0 else False,
                 )
             )
 

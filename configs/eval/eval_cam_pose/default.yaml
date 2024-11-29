@@ -1,0 +1,26 @@
+# @package _global_
+
+# seed for random number generators in pytorch, numpy and python.random
+seed: 42
+
+
+tags: ["eval", "eval_cam_pose"]
+
+ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/fast3r_local_head_better_scannetpp_and_arkit_pretrained_16views/runs/fast3r_local_head_better_scannetpp_and_arkit_pretrained_16views_4793676/checkpoints/last.ckpt
+# ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/more_co3d_finetune_16views/runs/more_co3d_finetune_16views_4865625/checkpoints/last.ckpt
+
+data:
+  num_views: 0 # do not use this field
+  data_module:
+    train_datasets: [] # do not initialize any datasets for training
+    validation_datasets:
+      - 100 @ Co3d_Multiview(split='test', num_views=${data.num_views_val}, window_degree_range=360, num_samples_per_window=100, ROOT='${data.data_root}/co3d_50_seqs_per_category_subset_processed', resolution=(512, 384), seed=777)
+    num_workers: 1 # debuggers don't like multiprocessing
+    pin_memory: true # disable gpu memory pin
+    batch_size_per_device_val: 1
+
+trainer:
+  log_every_n_steps: 1
+  devices: auto
+  limit_train_batches: 0
+  limit_val_batches: 10000

@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - eval_cam_pose/default
+
+task_name: eval_cam_pose_3views
+
+data:
+  num_views_val: 3

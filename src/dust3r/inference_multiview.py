@@ -4,6 +4,7 @@
 # --------------------------------------------------------
 # utilities needed for the inference
 # --------------------------------------------------------
+import time
 import torch
 import tqdm
 
@@ -40,7 +41,11 @@ def loss_of_one_batch(
         autocast_dict["dtype"] = torch.bfloat16
 
     with torch.autocast(**autocast_dict):
+        start_time = time.time()
         preds = model(views, profiling=profiling)
+        if profiling:
+            torch.cuda.synchronize(device=device)
+            print(f"model forward time: {time.time() - start_time:.3f}")
 
         # loss is supposed to be symmetric
         loss = (

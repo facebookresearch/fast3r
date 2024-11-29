@@ -3,6 +3,8 @@ _target_: src.models.multiview_dust3r_module.MultiViewDUSt3RLitModule
 pretrained: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth
 resume_from_checkpoint: ${ckpt_path}
 
+eval_use_pts3d_from_local_head: true
+
 train_criterion:
   _target_: src.dust3r.losses.ConfLossMultiview
   pixel_loss:

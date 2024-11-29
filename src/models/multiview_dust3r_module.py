@@ -69,6 +69,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
         compile: bool,
         pretrained: Optional[str] = None,
         resume_from_checkpoint: Optional[str] = None,
+        eval_use_pts3d_from_local_head: bool = True,
     ) -> None:
         super().__init__()
 
@@ -79,6 +80,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
         self.validation_criterion = validation_criterion
         self.pretrained = pretrained
         self.resume_from_checkpoint = resume_from_checkpoint
+        self.eval_use_pts3d_from_local_head = eval_use_pts3d_from_local_head
 
         # use register_buffer to save these with checkpoints
         # so that when we resume training, these bookkeeping variables are preserved
@@ -114,12 +116,14 @@ class MultiViewDUSt3RLitModule(LightningModule):
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         # Legacy: if the checkpoint does not contain the epoch_fraction, train_total_samples, and train_total_images
         # we manually add them to the checkpoint
-        if checkpoint["state_dict"].get("epoch_fraction") is None:
-            checkpoint["state_dict"]["epoch_fraction"] = self.epoch_fraction
-        if checkpoint["state_dict"].get("train_total_samples") is None:
-            checkpoint["state_dict"]["train_total_samples"] = self.train_total_samples
-        if checkpoint["state_dict"].get("train_total_images") is None:
-            checkpoint["state_dict"]["train_total_images"] = self.train_total_images
+        # if self.trainer.strategy.strategy_name != "deepseed":
+        #     if checkpoint["state_dict"].get("epoch_fraction") is None:
+        #         checkpoint["state_dict"]["epoch_fraction"] = self.epoch_fraction
+        #     if checkpoint["state_dict"].get("train_total_samples") is None:
+        #         checkpoint["state_dict"]["train_total_samples"] = self.train_total_samples
+        #     if checkpoint["state_dict"].get("train_total_images") is None:
+        #         checkpoint["state_dict"]["train_total_images"] = self.train_total_images
+        pass
 
     def on_train_start(self) -> None:
         """Lightning hook that is called when training begins."""
@@ -146,9 +150,9 @@ class MultiViewDUSt3RLitModule(LightningModule):
         # our custom dataset and sampler has to have epoch set by calling set_epoch
         for loader in self.trainer.val_dataloaders:
             if hasattr(loader, "dataset") and hasattr(loader.dataset, "set_epoch"):
-                loader.dataset.set_epoch(self.current_epoch)
+                loader.dataset.set_epoch(0)
             if hasattr(loader, "sampler") and hasattr(loader.sampler, "set_epoch"):
-                loader.sampler.set_epoch(self.current_epoch)
+                loader.sampler.set_epoch(0)
 
     def model_step(
         self, batch: List[Dict[str, torch.Tensor]], criterion: torch.nn.Module,
@@ -273,12 +277,13 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
         # Evaluate metrics for camera poses
         if dataset_name == "Co3d_v2":
-            self.evaluate_camera_poses(views, preds, estimate_focal_from_first_view=True)
+            self.evaluate_camera_poses(views, preds, niter_PnP=100, focal_length_estimation_method='first_view_from_global_head')
 
         # Evaluate point clouds only for the reconstruction datasets (DTU, 7-Scenes, and NRGBD)
         # eval only every 5 epochs because it's slow
-        if dataset_name in ['dtu', '7scenes', 'nrgbd'] and (self.current_epoch % 5 == 4 or self.current_epoch == 0):
-            self.evaluate_reconstruction(views, preds, dataset_name=dataset_name)
+        # if dataset_name in ['dtu', '7scenes', 'nrgbd'] and (self.current_epoch % 5 == 4 or self.current_epoch == 0):
+        if dataset_name in ['dtu', '7scenes', 'nrgbd']:
+            self.evaluate_reconstruction(views, preds, dataset_name=dataset_name, use_pts3d_from_local_head=self.eval_use_pts3d_from_local_head, min_conf_thr_percentile_for_local_alignment_and_icp=85)
 
         del views, preds
         torch.cuda.empty_cache()
@@ -418,6 +423,8 @@ class MultiViewDUSt3RLitModule(LightningModule):
             pts3d_global = pred['pts3d_in_other_view'][batch_index]   # Shape: (H, W, 3)
             conf_global = pred['conf'][batch_index]                   # Shape: (H, W)
 
+            H_cur, W_cur, _ = pts3d_local.shape
+
             # Get valid_mask if it exists
             if 'valid_mask' in view:
                 valid_mask = view['valid_mask'][batch_index]          # Shape: (H, W)
@@ -425,7 +432,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
                 valid_mask = torch.ones_like(conf_global, dtype=torch.bool)
 
             # Flatten the confidences to compute the threshold
-            conf_global_flat = conf_global.view(-1)  # Shape: (N,)
+            conf_global_flat = conf_global.reshape(-1)  # Shape: (N,)
 
             # Compute the confidence threshold
             conf_threshold_value = torch.quantile(conf_global_flat, min_conf_thr_percentile / 100.0)
@@ -475,7 +482,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
             pts_local_aligned_flat = s * (pts_local_flat @ R.T) + t  # Shape: (N, 3)
 
             # Reshape back to (H, W, 3)
-            pts_local_aligned = pts_local_aligned_flat.view(H, W, 3)
+            pts_local_aligned = pts_local_aligned_flat.view(H_cur, W_cur, 3)
 
             return (view_index, batch_index, pts_local_aligned)
 
@@ -502,11 +509,11 @@ class MultiViewDUSt3RLitModule(LightningModule):
             # Stack the aligned points back into a tensor of shape (B, H, W, 3)
             pred['pts3d_local_aligned_to_global'] = torch.stack(aligned_pts_dict[view_index], dim=0)
 
-    def evaluate_reconstruction(self, views, preds, dataset_name, min_conf_thr_percentile=0, use_pts3d_from_local_head=True):
+    def evaluate_reconstruction(self, views, preds, dataset_name, min_conf_thr_percentile_for_local_alignment_and_icp=0, use_pts3d_from_local_head=True):
         # align the local head output to the global output
         # and populate the preds with "pts3d_local_aligned_to_global"
         if use_pts3d_from_local_head:
-            self.align_local_pts3d_to_global(preds, views, min_conf_thr_percentile)
+            self.align_local_pts3d_to_global(preds, views, min_conf_thr_percentile=min_conf_thr_percentile_for_local_alignment_and_icp)
 
         batch_size = len(views[0]['img'])  # Assuming batch_size is consistent
 
@@ -530,14 +537,9 @@ class MultiViewDUSt3RLitModule(LightningModule):
                 pts_gt = view['pts3d'][i]  # Shape: (H, W, 3)
                 valid_mask = view['valid_mask'][i]  # Shape: (H, W)
 
-                # Compute the confidence threshold for this view
-                conf_flat = conf.view(-1)
-                conf_threshold_value = torch.quantile(conf_flat, min_conf_thr_percentile / 100.0)
-
                 # Create masks
-                conf_mask = conf >= conf_threshold_value  # Shape: (H, W)
-                final_mask_pred = valid_mask & conf_mask  # Predicted points: valid and high confidence
-                final_mask_gt_icp = final_mask_pred       # GT points for ICP: same positions as high-confidence predicted points
+                final_mask_pred = valid_mask              # Predicted points: valid points
+                final_mask_gt_icp = valid_mask       # GT points for ICP: all valid points
                 final_mask_gt_metrics = valid_mask        # GT points for metrics: all valid points
 
                 # Apply masks to predicted points and conf
@@ -559,7 +561,11 @@ class MultiViewDUSt3RLitModule(LightningModule):
                 colors_gt_masked = img[final_mask_gt_metrics]  # Colors at all valid GT points
 
                 # Weights for ICP alignment (all ones since we've already filtered low-confidence points)
-                weights_masked = torch.ones_like(conf_masked, dtype=torch.float32)
+                # Compute the confidence threshold for this view
+                conf_flat = conf.view(-1)
+                conf_threshold_value = torch.quantile(conf_flat, min_conf_thr_percentile_for_local_alignment_and_icp / 100.0)  # ICP should use high-confidence points
+
+                weights_masked = conf_masked >= conf_threshold_value  # Shape: (H, W)
 
                 # Append to lists
                 pred_pts_list.append(pts_pred_masked)
@@ -680,15 +686,21 @@ class MultiViewDUSt3RLitModule(LightningModule):
                 self.reconstruction_metrics_per_epoch[dataset_name] = {}
             self.reconstruction_metrics_per_epoch[dataset_name].update(result)  # Accumulate per dataset for the epoch
 
-    def evaluate_camera_poses(self, views, preds, estimate_focal_from_first_view=False):
-        """Evaluate camera poses and focal lengths using fast_pnp in parallel."""
+    def evaluate_camera_poses(self, views, preds, niter_PnP=10, focal_length_estimation_method='individual'):
+        """Evaluate camera poses and focal lengths using fast_pnp in parallel.
+           Focal_length_estimation_method can be 'individual' or 'first_view_from_local_head' or 'first_view_from_global_head'.
+        """
+
+        # If focal_length_estimation_method is 'first_view_from_local_head', align local pts3d to global
+        if focal_length_estimation_method == 'first_view_from_local_head':
+            self.align_local_pts3d_to_global(preds, views)
 
         # in-place correction of the orientation of the predicted points and confidence maps
         # this is because the data loader transposed the input images and valid_masks to landscape
         self.correct_preds_orientation(preds, views)
 
         # Estimate camera poses using the provided function
-        poses_c2w_estimated, estimated_focals = self.estimate_camera_poses(preds=preds, views=views, niter_PnP=10, estimate_focal_from_first_view=estimate_focal_from_first_view)
+        poses_c2w_estimated, estimated_focals = self.estimate_camera_poses(preds=preds, views=views, niter_PnP=niter_PnP, focal_length_estimation_method=focal_length_estimation_method)
 
         # Get ground truth poses
         poses_c2w_gt = [view['camera_pose'] for view in views]
@@ -742,7 +754,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
     # Function to estimate camera poses using fast_pnp
     @staticmethod
-    def estimate_camera_poses(preds, views=None, niter_PnP=10, estimate_focal_from_first_view=False):
+    def estimate_camera_poses(preds, views=None, niter_PnP=10, focal_length_estimation_method='individual'):
         """Estimate camera poses and focal lengths using fast_pnp in parallel."""
 
         batch_size = len(preds[0]["pts3d_in_other_view"])  # Get the batch size
@@ -758,17 +770,26 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
         # Estimate the focal length
         def estimate_focal_for_sample(sample_preds):
-            if estimate_focal_from_first_view:
-                # Get the first view's pts3d and confidence map
+            if focal_length_estimation_method == 'first_view_from_global_head':
+                # Use global head outputs for focal length estimation
                 pts3d_i = sample_preds[0]["pts3d_in_other_view"].unsqueeze(0)  # Shape: (1, H, W, 3)
                 conf_i = sample_preds[0]["conf"].unsqueeze(0)                  # Shape: (1, H, W)
+            elif focal_length_estimation_method == 'first_view_from_local_head':
+                # Use local head outputs for focal length estimation
+                pts3d_i = sample_preds[0]["pts3d_local_aligned_to_global"].unsqueeze(0)  # Shape: (1, H, W, 3)
+                conf_i = sample_preds[0]["conf_local"].unsqueeze(0)                       # Shape: (1, H, W)
+            elif focal_length_estimation_method == 'individual':
+                # Focal length will be estimated individually per view
+                return sample_preds
+            else:
+                raise ValueError(f"Unknown focal_length_estimation_method: {focal_length_estimation_method}")
 
-                # Estimate focal length using the provided function and confidence mask
-                estimated_focal = estimate_focal(pts3d_i, conf_i, min_conf_thr_percentile=90)
+            # Estimate focal length using the provided function and confidence mask
+            estimated_focal = estimate_focal(pts3d_i, conf_i, min_conf_thr_percentile=85)
 
-                # Store the estimated focal length in sample_preds
-                for view_pred in sample_preds:
-                    view_pred["focal_length"] = estimated_focal
+            # Store the estimated focal length in sample_preds
+            for view_pred in sample_preds:
+                view_pred["focal_length"] = estimated_focal
 
             return sample_preds
 
@@ -831,6 +852,38 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
                 pred["conf"] = conf_list
                 pred["pts3d_in_other_view"] = pts3d_list
+
+                if "pts3d_local" in pred:
+                    conf_local_list = []
+                    pts3d_local_list = []
+                    if "pts3d_local_aligned_to_global" in pred:
+                        pts3d_local_aligned_to_global_list = []
+
+                    for i in range(view["true_shape"].shape[0]):
+                        H, W = view["true_shape"][i]
+                        if H > W:
+                            # Transpose the tensors
+                            transposed_conf_local = pred["conf_local"][i].transpose(0, 1)
+                            transposed_pts3d_local = pred["pts3d_local"][i].transpose(0, 1)
+                            if "pts3d_local_aligned_to_global" in pred:
+                                transposed_pts3d_local_aligned_to_global = pred["pts3d_local_aligned_to_global"][i].transpose(0, 1)
+
+                            # Append the transposed tensors to the lists
+                            conf_local_list.append(transposed_conf_local)
+                            pts3d_local_list.append(transposed_pts3d_local)
+                            if "pts3d_local_aligned_to_global" in pred:
+                                pts3d_local_aligned_to_global_list.append(transposed_pts3d_local_aligned_to_global)
+                        else:
+                            # Append the original tensors to the lists
+                            conf_local_list.append(pred["conf_local"][i])
+                            pts3d_local_list.append(pred["pts3d_local"][i])
+                            if "pts3d_local_aligned_to_global" in pred:
+                                pts3d_local_aligned_to_global_list.append(pred["pts3d_local_aligned_to_global"][i])
+
+                    pred["conf_local"] = conf_local_list
+                    pred["pts3d_local"] = pts3d_local_list
+                    if "pts3d_local_aligned_to_global" in pred:
+                        pred["pts3d_local_aligned_to_global"] = pts3d_local_aligned_to_global_list
 
     def configure_optimizers(self) -> Dict[str, Any]:
         optimizer = self.hparams.optimizer(params=self.trainer.model.parameters())

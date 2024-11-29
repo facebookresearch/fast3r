@@ -291,10 +291,10 @@ def pixel_grid(H, W):
     return np.mgrid[:W, :H].T.astype(np.float32)
 
 
-def fast_pnp(pts3d, focal, msk, device, pp=None, niter_PnP=10):
+def fast_pnp(pts3d, focal, msk, device, pp=None, niter_PnP=10, num_guessed_focals=100):
     # extract camera poses and focals with RANSAC-PnP
     if msk.sum() < 4:
-        return None  # we need at least 4 points for PnP
+        return None, None  # we need at least 4 points for PnP
     pts3d, msk = map(to_numpy, (pts3d, msk))
 
     H, W, THREE = pts3d.shape
@@ -303,7 +303,7 @@ def fast_pnp(pts3d, focal, msk, device, pp=None, niter_PnP=10):
 
     if focal is None:
         S = max(W, H)
-        tentative_focals = np.geomspace(S / 2, S * 3, num=100)
+        tentative_focals = np.geomspace(S / 2, S * 3, num=num_guessed_focals)
     else:
         tentative_focals = [focal]
 

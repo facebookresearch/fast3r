@@ -36,8 +36,7 @@ def main():
 #SBATCH --time=7-00:00:00  # 7 days
 #SBATCH --mail-user=jianingy@meta.com
 #SBATCH --mail-type=BEGIN,END
-#SBATCH --account=cortex
-#SBATCH --qos=cortex
+#SBATCH --account=3dfy
 #SBATCH --nodes={nodes}
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96

@@ -1,0 +1,87 @@
+# @package _global_
+
+defaults:
+  - override /model: fast3r
+
+# seed for random number generators in pytorch, numpy and python.random
+seed: 42
+
+
+tags: ["train", "mega_training_768gpus"]
+
+task_name: mega_training_768gpus
+slurm_job_id: ??? # must set in the command line
+
+paths:
+  run_folder_name: ${task_name}_${slurm_job_id}
+
+logger:
+  wandb:
+    name: ${task_name}_${slurm_job_id}
+
+data:
+  num_views: 20
+  num_views_val: 10
+  data_scaling: 1.0
+  data_module:
+    pin_memory: true
+    num_workers: 6
+    num_workers_val: 1 # have to be a low number when using DeepSpeed ZeRO-2
+    batch_size_per_device: 1
+    batch_size_per_device_val: 2
+    train_datasets:
+      - 80_000 @ Co3d_Multiview(split='train', data_scaling=${data.data_scaling}, num_views=${data.num_views}, window_degree_range=360, num_samples_per_window=100, ROOT='/fsx-cortex-datacache/jianingy/dust3r_data/co3d_all_seqs_per_category_subset_processed', aug_crop=16, mask_bg='rand', resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)
+      - 80_000 @ ScanNetpp_Multiview(split='train', data_scaling=${data.data_scaling}, num_views=${data.num_views}, window_size=${python_eval:"${data.num_views} * 2"}, num_samples_per_window=5, ROOT='${data.data_root}/scannetpp_processed', aug_crop=256, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)
+      - 80_000 @ ARKitScenes_Multiview(split='train', data_scaling=${data.data_scaling}, num_views=${data.num_views}, window_size=${python_eval:"${data.num_views} * 5"}, num_samples_per_window=5, ROOT='${data.data_root}/arkitscenes_processed', aug_crop=256, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)
+      - 80_000 @ Habitat_Multiview(1_000, split='train', data_scaling=${data.data_scaling}, num_views=${data.num_views}, ROOT='${data.data_root}/habitat_processed', aug_crop=16, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)
+      - 80_000 @ BlendMVS(split='train', num_frames=${data.num_views}, num_seq=100, ROOT='/fsx-cortex-datacache/jianingy/dust3r_data/datasets_raw/BlendedMVS', resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)])
+      - 80_000 @ MegaDepth_Multiview(split='train', num_views=${data.num_views}, window_size=${python_eval:"${data.num_views} * 2"}, num_samples_per_window=5, ROOT='${data.data_root}/megadepth_processed', aug_crop=16, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)
+    validation_datasets:
+      - 100 @ Co3d_Multiview(split='test', num_views=${data.num_views_val}, window_degree_range=360, num_samples_per_window=100, ROOT='${data.data_root}/co3d_50_seqs_per_category_subset_processed', resolution=(512, 384), seed=777)
+      - 100 @ ScanNetpp_Multiview(split='train', num_views=${data.num_views_val}, window_size=${python_eval:"${data.num_views_val} * 2"}, num_samples_per_window=1, ROOT='${data.data_root}/scannetpp_processed', resolution=(512, 384), seed=777)
+      - 100 @ ARKitScenes_Multiview(split='train', num_views=${data.num_views_val}, window_size=${python_eval:"${data.num_views_val} * 5"}, num_samples_per_window=1, ROOT='${data.data_root}/arkitscenes_processed', resolution=(512, 384), seed=777)
+      - 100 @ Habitat_Multiview(100, split='val', num_views=${data.num_views_val}, ROOT='${data.data_root}/habitat_processed', resolution=(512, 384), seed=777)
+      - 100 @ BlendMVS(split='test', num_frames=${data.num_views_val}, num_seq=1, ROOT='/fsx-cortex-datacache/jianingy/dust3r_data/datasets_raw/BlendedMVS', resolution=(512, 384), seed=777)
+      - 100 @ MegaDepth_Multiview(split='val', num_views=${data.num_views_val}, window_size=${python_eval:"${data.num_views_val} * 2"}, num_samples_per_window=1, ROOT='${data.data_root}/megadepth_processed', resolution=(512, 384), seed=777)
+      - DTU(split='test', ROOT='${data.data_root}/dtu_test_mvsnet_release', resolution=512, num_seq=1, full_video=True, kf_every=5)
+      - SevenScenes(split='test', ROOT='${data.data_root}/7_scenes_processed', resolution=512, num_seq=1, full_video=True, kf_every=20)
+      - NRGBD(split='test', ROOT='${data.data_root}/neural_rgbd', resolution=512, num_seq=1, full_video=True, kf_every=40)
+
+model:
+  net:
+    head_args:
+      with_local_head: True
+    decoder_args:
+      random_image_idx_embedding: true
+      enc_embed_dim: ${model.net.encoder_args.embed_dim}
+      embed_dim: 1024
+      num_heads: 16
+      depth: 24
+      mlp_ratio: 4.0
+      qkv_bias: true
+      drop: 0.0
+      attn_drop: 0.0
+      attn_implementation: flash_attention
+
+  train_criterion:
+    _target_: src.dust3r.losses.ConfLossMultiviewV2
+    pixel_loss:
+      _target_: src.dust3r.losses.Regr3DMultiviewV3
+      criterion:
+        _target_: src.dust3r.losses.L21Loss
+      norm_mode: avg_dis
+    alpha: 0.2
+
+  validation_criterion:
+    _target_: src.dust3r.losses.ConfLossMultiviewV2
+    pixel_loss:
+      _target_: src.dust3r.losses.Regr3DMultiviewV3
+      criterion:
+        _target_: src.dust3r.losses.L21Loss
+      norm_mode: avg_dis
+    alpha: 0.2
+
+trainer:
+  devices: auto
+  max_epochs: 500
+  strategy: deepspeed_stage_2

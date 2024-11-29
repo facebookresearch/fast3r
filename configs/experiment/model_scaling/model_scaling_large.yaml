@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  - model_scaling/default
+
+task_name: model_scaling_large
+
+ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/model_scaling_large/runs/model_scaling_large_5001122/checkpoints/last.ckpt
+
+model:
+  net:
+    decoder_args:
+      random_image_idx_embedding: true
+      enc_embed_dim: ${model.net.encoder_args.embed_dim}
+      embed_dim: 1024
+      num_heads: 16
+      depth: 24
+      mlp_ratio: 4.0
+      qkv_bias: true
+      drop: 0.0
+      attn_drop: 0.0
+      attn_implementation: flash_attention

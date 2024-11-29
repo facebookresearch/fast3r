@@ -3,7 +3,9 @@ from typing import Any, Dict, List, Tuple
 
 import hydra
 import rootutils
+import signal  # noqa: F401
 from lightning import LightningDataModule, LightningModule, Trainer
+from lightning.pytorch.utilities.deepspeed import convert_zero_checkpoint_to_fp32_state_dict
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig, OmegaConf
 
@@ -94,6 +96,14 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if logger:
         log.info("Logging hyperparameters!")
         log_hyperparameters(object_dict)
+
+    # if cfg.ckpt_path is a directory, then it is a DeepSpeed checkpoint, convert it to a regular checkpoint
+    if os.path.isdir(cfg.ckpt_path):
+        # it is a DeepSpeed checkpoint, convert it to a regular checkpoint
+        new_ckpt_path = os.path.join(os.path.dirname(cfg.ckpt_path), 'last_aggregated.ckpt')
+        if not os.path.exists(new_ckpt_path):
+            convert_zero_checkpoint_to_fp32_state_dict(checkpoint_dir=cfg.ckpt_path, output_file=new_ckpt_path, tag=None)
+        cfg.ckpt_path = new_ckpt_path
 
     log.info("Starting testing!")
     trainer.validate(model=model, datamodule=datamodule, ckpt_path=cfg.ckpt_path)

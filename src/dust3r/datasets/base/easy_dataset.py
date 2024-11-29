@@ -33,7 +33,7 @@ class EasyDataset:
         pass  # nothing to do by default
 
     def set_ratio(self, train_ratio):
-        pass
+        self.train_ratio = train_ratio
 
     def make_sampler(
         self, batch_size, shuffle=True, world_size=1, rank=0, drop_last=True
