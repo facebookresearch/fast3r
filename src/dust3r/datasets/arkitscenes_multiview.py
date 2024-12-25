@@ -1,4 +1,5 @@
 import os.path as osp
+import time
 import cv2
 import numpy as np
 import random
@@ -87,6 +88,7 @@ class ARKitScenes_Multiview(BaseStereoViewDataset):
         return len(self.combinations)
 
     def _get_views(self, idx, resolution, rng):
+        start_time = time.time()
         image_indices = self.combinations[idx]
 
         views = []
@@ -118,4 +120,5 @@ class ARKitScenes_Multiview(BaseStereoViewDataset):
                 instance=f'{str(idx)}_{str(view_idx)}',
             ))
 
+        print(f"Time taken for idx {idx}: {time.time() - start_time:.2f}s")
         return views

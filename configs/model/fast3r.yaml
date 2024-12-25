@@ -6,18 +6,18 @@ resume_from_checkpoint: ${ckpt_path}
 eval_use_pts3d_from_local_head: true
 
 train_criterion:
-  _target_: src.dust3r.losses.ConfLossMultiview
+  _target_: src.dust3r.losses.ConfLossMultiviewV2
   pixel_loss:
-    _target_: src.dust3r.losses.Regr3DMultiviewV2
+    _target_: src.dust3r.losses.Regr3DMultiviewV3
     criterion:
       _target_: src.dust3r.losses.L21Loss
     norm_mode: avg_dis
   alpha: 0.2
 
 validation_criterion:
-  _target_: src.dust3r.losses.ConfLossMultiview
+  _target_: src.dust3r.losses.ConfLossMultiviewV2
   pixel_loss:
-    _target_: src.dust3r.losses.Regr3DMultiviewV2
+    _target_: src.dust3r.losses.Regr3DMultiviewV3
     criterion:
       _target_: src.dust3r.losses.L21Loss
     norm_mode: avg_dis
@@ -60,6 +60,7 @@ net:
     pos_embed: RoPE100
     attn_implementation: flash_attention
   decoder_args:
+    decoder_type: fast3r
     random_image_idx_embedding: true
     enc_embed_dim: ${model.net.encoder_args.embed_dim}
     embed_dim: 768

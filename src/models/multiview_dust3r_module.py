@@ -281,9 +281,12 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
         # Evaluate point clouds only for the reconstruction datasets (DTU, 7-Scenes, and NRGBD)
         # eval only every 5 epochs because it's slow
-        # if dataset_name in ['dtu', '7scenes', 'nrgbd'] and (self.current_epoch % 5 == 4 or self.current_epoch == 0):
-        if dataset_name in ['dtu', '7scenes', 'nrgbd']:
-            self.evaluate_reconstruction(views, preds, dataset_name=dataset_name, use_pts3d_from_local_head=self.eval_use_pts3d_from_local_head, min_conf_thr_percentile_for_local_alignment_and_icp=85)
+        if dataset_name in ['dtu', '7scenes', 'nrgbd'] and (self.current_epoch % 5 == 4 or self.current_epoch == 0):
+        # if dataset_name in ['dtu', '7scenes', 'nrgbd']:
+            self.evaluate_reconstruction(views, preds, dataset_name=dataset_name,
+                                         use_pts3d_from_local_head=self.eval_use_pts3d_from_local_head,
+                                         min_conf_thr_percentile_for_local_alignment_and_icp=85,
+                                         min_conf_thr_percentile_for_metric_cacluation=85)  # use only the very confident points for alignment and use most of the points for metric calculation
 
         del views, preds
         torch.cuda.empty_cache()
@@ -298,7 +301,7 @@ class MultiViewDUSt3RLitModule(LightningModule):
         self.log("trainer/total_samples", self.train_total_samples.cpu().item(), sync_dist=True)
         self.log("trainer/total_images", self.train_total_images.cpu().item(), sync_dist=True)
 
-        self.aggregate_and_log_reconstruction_detail_losses()
+        # self.aggregate_and_log_reconstruction_detail_losses()
 
         # Log the 3D reconstruction metrics
         self.aggregate_and_log_reconstruction_metrics()
@@ -312,28 +315,52 @@ class MultiViewDUSt3RLitModule(LightningModule):
         # log the detailes loss for uneven view datasets
         # Gather and aggregate detailed losses for uneven-view datasets across all ranks
         if torch.distributed.is_initialized():
-            gathered_detailed_losses = [None] * torch.distributed.get_world_size()
-            all_gather_object(gathered_detailed_losses, self.uneven_view_detailed_losses)
+            gathered_detailed_losses = [None] * torch.distributed.get_world_size() if self.global_rank == 0 else None
+            # all_gather_object(gathered_detailed_losses, self.uneven_view_detailed_losses)
+            # gather detailed losses from all ranks to rank 0
+            torch.distributed.gather_object(self.uneven_view_detailed_losses, gathered_detailed_losses, dst=0)
 
-            # Aggregate gathered data
-            aggregated_losses = {}
-            for rank_losses in gathered_detailed_losses:
-                for dataset_name, loss_dict in rank_losses.items():
-                    if dataset_name not in aggregated_losses:
-                        aggregated_losses[dataset_name] = {}
+            # log the detailed losses in rank 0
+            if self.global_rank == 0:
+                # Aggregate gathered data
+                aggregated_losses = {}
+                for rank_losses in gathered_detailed_losses:
+                    for dataset_name, loss_dict in rank_losses.items():
+                        if dataset_name not in aggregated_losses:
+                            aggregated_losses[dataset_name] = {}
+                        for key, values in loss_dict.items():
+                            if key not in aggregated_losses[dataset_name]:
+                                aggregated_losses[dataset_name][key] = []
+                            aggregated_losses[dataset_name][key].extend(values)
+
+                # Compute and log the mean of each loss
+                for dataset_name, loss_dict in aggregated_losses.items():
                     for key, values in loss_dict.items():
-                        if key not in aggregated_losses[dataset_name]:
-                            aggregated_losses[dataset_name][key] = []
-                        aggregated_losses[dataset_name][key].extend(values)
-
-            # Compute and log the mean of each loss
-            for dataset_name, loss_dict in aggregated_losses.items():
-                for key, values in loss_dict.items():
-                    mean_value = np.mean(values)
-                    self.log(key, mean_value, sync_dist=True)
+                        mean_value = np.mean(values)
+                        self.log(key, mean_value, rank_zero_only=True)
 
             # Clear the dictionary after logging
             self.uneven_view_detailed_losses.clear()
+
+            # # Aggregate gathered data
+            # aggregated_losses = {}
+            # for rank_losses in gathered_detailed_losses:
+            #     for dataset_name, loss_dict in rank_losses.items():
+            #         if dataset_name not in aggregated_losses:
+            #             aggregated_losses[dataset_name] = {}
+            #         for key, values in loss_dict.items():
+            #             if key not in aggregated_losses[dataset_name]:
+            #                 aggregated_losses[dataset_name][key] = []
+            #             aggregated_losses[dataset_name][key].extend(values)
+
+            # # Compute and log the mean of each loss
+            # for dataset_name, loss_dict in aggregated_losses.items():
+            #     for key, values in loss_dict.items():
+            #         mean_value = np.mean(values)
+            #         self.log(key, mean_value, sync_dist=True)
+
+            # # Clear the dictionary after logging
+            # self.uneven_view_detailed_losses.clear()
 
     def aggregate_and_log_reconstruction_metrics(self):
         # Gather and deduplicate metrics by dataset across all ranks after all batches
@@ -509,13 +536,18 @@ class MultiViewDUSt3RLitModule(LightningModule):
             # Stack the aligned points back into a tensor of shape (B, H, W, 3)
             pred['pts3d_local_aligned_to_global'] = torch.stack(aligned_pts_dict[view_index], dim=0)
 
-    def evaluate_reconstruction(self, views, preds, dataset_name, min_conf_thr_percentile_for_local_alignment_and_icp=0, use_pts3d_from_local_head=True):
+    def evaluate_reconstruction(self, views, preds, dataset_name,
+                                min_conf_thr_percentile_for_local_alignment_and_icp=0,
+                                min_conf_thr_percentile_for_metric_cacluation=0,
+                                use_pts3d_from_local_head=True):
         # align the local head output to the global output
         # and populate the preds with "pts3d_local_aligned_to_global"
         if use_pts3d_from_local_head:
             self.align_local_pts3d_to_global(preds, views, min_conf_thr_percentile=min_conf_thr_percentile_for_local_alignment_and_icp)
 
         batch_size = len(views[0]['img'])  # Assuming batch_size is consistent
+
+        assert min_conf_thr_percentile_for_local_alignment_and_icp >= min_conf_thr_percentile_for_metric_cacluation # Ensure that the confidence threshold for ICP is higher than the one for metrics
 
         # Define the function to process a single sample
         def process_sample(i):
@@ -537,10 +569,15 @@ class MultiViewDUSt3RLitModule(LightningModule):
                 pts_gt = view['pts3d'][i]  # Shape: (H, W, 3)
                 valid_mask = view['valid_mask'][i]  # Shape: (H, W)
 
+                # mask out low confidence points
+                conf_flat = conf.view(-1)
+                conf_threshold_value_metric_calc = torch.quantile(conf_flat, min_conf_thr_percentile_for_metric_cacluation / 100.0)  # Metrics should use all valid points
+                conf_mask_metric_calc = conf >= conf_threshold_value_metric_calc
+
                 # Create masks
-                final_mask_pred = valid_mask              # Predicted points: valid points
-                final_mask_gt_icp = valid_mask       # GT points for ICP: all valid points
-                final_mask_gt_metrics = valid_mask        # GT points for metrics: all valid points
+                final_mask_pred = valid_mask & conf_mask_metric_calc         # Predicted points: valid and high-conf points
+                final_mask_gt_icp = valid_mask & conf_mask_metric_calc       # GT points for ICP: all valid and high-conf points
+                final_mask_gt_metrics = valid_mask                           # GT points for metrics: all valid points
 
                 # Apply masks to predicted points and conf
                 pts_pred_masked = pts_pred[final_mask_pred]      # High-confidence predicted points
@@ -551,7 +588,6 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
                 # Apply mask to GT points for metrics
                 pts_gt_masked_metrics = pts_gt[final_mask_gt_metrics]  # All valid GT points in this view
-                gt_pts_list_metrics.append(pts_gt_masked_metrics)
 
                 # Get image for colors
                 img = view['img'][i]  # Shape: (3, H, W)
@@ -562,18 +598,18 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
                 # Weights for ICP alignment (all ones since we've already filtered low-confidence points)
                 # Compute the confidence threshold for this view
-                conf_flat = conf.view(-1)
-                conf_threshold_value = torch.quantile(conf_flat, min_conf_thr_percentile_for_local_alignment_and_icp / 100.0)  # ICP should use high-confidence points
+                conf_threshold_value_for_icp = torch.quantile(conf_flat, min_conf_thr_percentile_for_local_alignment_and_icp / 100.0)  # ICP should use high-confidence points
 
-                weights_masked = conf_masked >= conf_threshold_value  # Shape: (H, W)
+                weights_masked = conf_masked >= conf_threshold_value_for_icp  # Shape: (H, W)
 
                 # Append to lists
-                pred_pts_list.append(pts_pred_masked)
-                gt_pts_list_icp.append(pts_gt_masked_icp)
-                conf_list.append(conf_masked)
-                colors_pred_list.append(colors_pred_masked)
-                colors_gt_list.append(colors_gt_masked)
-                weights_list.append(weights_masked)
+                pred_pts_list.append(pts_pred_masked)              # shape: points above metric calc conf (N_pred)
+                gt_pts_list_icp.append(pts_gt_masked_icp)          # shape: points above metric calc conf (N_pred)
+                conf_list.append(conf_masked)                      # shape: points above metric calc conf (N_pred)
+                colors_pred_list.append(colors_pred_masked)        # shape: points above metric calc conf (N_pred)
+                colors_gt_list.append(colors_gt_masked)            # shape: all valid points (N_gt)
+                weights_list.append(weights_masked)                # shape: points above metric calc conf (N_pred)
+                gt_pts_list_metrics.append(pts_gt_masked_metrics)  # shape: all valid points (N_gt)
 
             # Concatenate points, colors, confidences, and weights
             if len(pred_pts_list) == 0 or len(gt_pts_list_metrics) == 0:

@@ -1,6 +1,7 @@
 import os
 from copy import deepcopy
 import time
+from typing import Optional
 from einops import rearrange
 import huggingface_hub
 from omegaconf import DictConfig
@@ -13,6 +14,7 @@ from src.dust3r.heads.postprocess import postprocess
 from src.dust3r.heads.dpt_head import PixelwiseTaskWithDPT
 from src.croco.models.blocks import Block, PositionGetter
 from src.croco.models.pos_embed import RoPE2D, get_1d_sincos_pos_embed_from_grid
+from src.models.components.llama import TransformerBlock, RMSNorm, precompute_freqs_cis
 from packaging import version
 from functools import partial
 
@@ -78,7 +80,17 @@ class Fast3R(nn.Module,
             raise ValueError(f"Unsupported encoder type: {encoder_args['encoder_type']}")
 
     def build_decoder(self, decoder_args: dict):
-        self.decoder = Fast3RDecoder(**decoder_args)
+        decoder_args["decoder_type"] = decoder_args.get('decoder_type', 'fast3r')  # default to fast3r if not specified
+        if decoder_args["decoder_type"] == 'fast3r':
+            decoder_args = deepcopy(decoder_args)
+            decoder_args.pop('decoder_type')
+            self.decoder = Fast3RDecoder(**decoder_args)
+        elif decoder_args["decoder_type"] == 'llama':
+            decoder_args = deepcopy(decoder_args)
+            decoder_args.pop('decoder_type')
+            self.decoder = LlamaDecoder(**decoder_args)
+        else:
+            raise ValueError(f"Unsupported decoder type: {decoder_args['decoder_type']}")
 
     def build_head(
         self,
@@ -750,6 +762,165 @@ class Fast3RDecoder(nn.Module):
             final_output.append(x)
 
         x = self.dec_norm(x)
+        final_output[-1] = x
+
+        return final_output
+
+class LlamaDecoder(nn.Module):
+    def __init__(
+        self,
+        random_image_idx_embedding: bool,
+        enc_embed_dim: int,
+        embed_dim: int = 4096,
+        n_layers: int = 32,
+        n_heads: int = 32,
+        n_kv_heads: Optional[int] = None,
+        multiple_of: int = 256,  # make SwiGLU hidden layer size multiple of large power of 2
+        ffn_dim_multiplier: Optional[float] = None,
+        norm_eps: float = 1e-5,
+        rope_theta: float = 10000,
+        max_seq_len: int = 1000,
+        is_causal: bool = False,  # use bidirectional attention
+        depth_init: bool = True,
+        **kwargs
+    ):
+        super(LlamaDecoder, self).__init__()
+
+        # assign the flags to attributes for later use
+        self.random_image_idx_embedding = random_image_idx_embedding
+        self.rope_theta = rope_theta
+
+        # Compute head dimension
+        self.head_dim = embed_dim // n_heads
+
+        # Precompute freqs_cis
+        self.precomputed_freqs_cis = self._precompute_freqs_cis(max_seq_len=max_seq_len)  # complex64, it is a tensor and not a parameter or buffer because otherwise DeepSpeed will convert it to float32
+
+        # **Learnable embedding for view 0**
+        self.view0_embed = nn.Parameter(torch.zeros(embed_dim))
+        nn.init.normal_(self.view0_embed, mean=0.0, std=0.02)
+
+        # Transfer from encoder to decoder dimensions
+        self.decoder_embed = nn.Linear(enc_embed_dim, embed_dim, bias=True)
+
+        # Initialize Transformer layers
+        self.layers = nn.ModuleList([
+            TransformerBlock(layer_id=i, n_heads=n_heads, n_kv_heads=n_kv_heads, dim=embed_dim, multiple_of=multiple_of,
+                             ffn_dim_multiplier=ffn_dim_multiplier, n_layers=n_layers, is_causal=is_causal, norm_eps=norm_eps, depth_init=depth_init)
+            for i in range(n_layers)
+        ])
+
+        self.norm = RMSNorm(dim=embed_dim, eps=norm_eps)
+
+    def _precompute_freqs_cis(self, max_seq_len) -> torch.Tensor:
+        return precompute_freqs_cis(
+            self.head_dim,
+            # Need to compute until at least the max token limit for generation
+            # (use 2x max sequence length to be safe)
+            max_seq_len,
+            self.rope_theta,
+        )
+
+    def _generate_per_rank_generator(self):
+        # Generate a per-rank random seed
+        per_forward_pass_seed = torch.randint(0, 2 ** 32, (1,)).item()
+        world_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        per_rank_seed = per_forward_pass_seed + world_rank
+
+        # Set the seed for the random generator
+        per_rank_generator = torch.Generator()
+        per_rank_generator.manual_seed(per_rank_seed)
+        return per_rank_generator
+
+    def _get_random_freqs_cis(self, encoded_feats, batch_size, num_views, max_image_idx, device):
+        """
+        Generates freqs_cis for each patch based on random image indices.
+
+        Args:
+            encoded_feats (list of tensors): Encoded features for each view.
+            batch_size (int): Number of samples in the batch.
+            num_views (int): Number of views per sample.
+            max_image_idx (int): Maximum image index for embedding.
+            device (torch.device): Device to move data to.
+
+        Returns:
+            torch.Tensor: freqs_cis of shape (batch_size, total_num_patches, head_dim)
+        """
+        # Generate random image IDs (on CPU)
+        image_ids = torch.zeros(batch_size, num_views, dtype=torch.long)
+
+        # First view is always 0 for all samples
+        image_ids[:, 0] = 0
+
+        # Get a generator that is unique to each rank
+        per_rank_generator = self._generate_per_rank_generator()
+
+        # Generate random IDs for the remaining views
+        for b in range(batch_size):
+            # Use the torch.Generator for randomness
+            random_ids = torch.randperm(max_image_idx, generator=per_rank_generator)[:num_views - 1] + 1
+            image_ids[b, 1:] = random_ids
+
+        # Move the image IDs to the correct device
+        image_ids = image_ids.to(device)
+        self.precomputed_freqs_cis = self.precomputed_freqs_cis.to(device)
+
+        # Initialize list to store positional embeddings for all views
+        freqs_cis_list = []
+
+        for i in range(num_views):
+            # Retrieve the number of patches for this view
+            num_patches = encoded_feats[i].shape[1]
+
+            # Gather the positional embeddings for the entire batch based on the random image IDs
+            freqs_cis_for_view = self.precomputed_freqs_cis[image_ids[:, i]]  # (B, D)
+
+            # Expand the positional embeddings to match the number of patches
+            freqs_cis_for_view = freqs_cis_for_view.unsqueeze(1).repeat(1, num_patches, 1)  # (B, Npatches, D)
+
+            freqs_cis_list.append(freqs_cis_for_view)
+
+        # Concatenate positional embeddings for all views along the patch dimension
+        freqs_cis = torch.cat(freqs_cis_list, dim=1)  # (B, Npatches_total, D)
+
+        return freqs_cis
+
+    def forward(self, encoded_feats, positions, image_ids):
+        x = torch.cat(encoded_feats, dim=1)  # Concatenate along the patch dimension
+        pos = torch.cat(positions, dim=1)
+        batch_size = x.shape[0]
+        device = x.device
+
+        x = self.decoder_embed(x)
+
+        # Generate freqs_cis based on image_ids
+        if self.random_image_idx_embedding:
+            freqs_cis = self._get_random_freqs_cis(
+                encoded_feats=encoded_feats,
+                batch_size=batch_size,
+                num_views=len(encoded_feats),
+                max_image_idx=self.precomputed_freqs_cis.shape[0] - 1,
+                device=device
+            )
+        else:
+            # Use image_ids to index into precomputed_freqs_cis
+            num_images = (torch.max(image_ids) + 1).cpu().item()
+            image_idx_emb = self.precomputed_freqs_cis[:num_images]
+            freqs_cis = image_idx_emb[image_ids]
+
+        # Create a mask for view 0 patches
+        view0_mask = (image_ids == 0).unsqueeze(-1).float()  # Shape: (batch_size, total_num_patches, 1)
+
+        final_output = [x]
+
+        for layer in self.layers:
+            # Add the view0_embedding to the features of view 0 before each transformer layer
+            x = x + view0_mask * self.view0_embed  # Broadcasts self.view0_embed over the last dimension
+
+            x = layer(x, freqs_cis)
+            final_output.append(x)
+
+        x = self.norm(x)
         final_output[-1] = x
 
         return final_output

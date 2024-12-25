@@ -1,3 +1,5 @@
+# Built on top of https://github.com/HengyiWang/spann3r/blob/main/spann3r/tools/eval_recon.py
+
 import numpy as np
 from scipy.spatial import cKDTree as KDTree
 from sklearn.neighbors import NearestNeighbors
@@ -5,14 +7,14 @@ import faiss
 
 def completion_ratio(gt_points, rec_points, dist_th=0.05):
     gen_points_kd_tree = KDTree(rec_points)
-    distances, _ = gen_points_kd_tree.query(gt_points, workers=36)
+    distances, _ = gen_points_kd_tree.query(gt_points, workers=24)
     comp_ratio = np.mean((distances < dist_th).astype(np.float32))
     return comp_ratio
 
 
 def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None, device=None):
     gt_points_kd_tree = KDTree(gt_points)
-    distances, idx = gt_points_kd_tree.query(rec_points, workers=36)
+    distances, idx = gt_points_kd_tree.query(rec_points, workers=24)
     acc = np.mean(distances)
 
     acc_median = np.median(distances)
@@ -28,7 +30,7 @@ def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None, device=No
 
 def completion(gt_points, rec_points, gt_normals=None, rec_normals=None, device=None):
     gt_points_kd_tree = KDTree(rec_points)
-    distances, idx = gt_points_kd_tree.query(gt_points, workers=36)
+    distances, idx = gt_points_kd_tree.query(gt_points, workers=24)
     comp = np.mean(distances)
     comp_median = np.median(distances)
 

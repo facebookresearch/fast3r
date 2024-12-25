@@ -39,9 +39,9 @@ def main():
 #SBATCH --account=3dfy
 #SBATCH --qos=perception_shared
 #SBATCH --nodes={nodes}
+#SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=12
-#SBATCH --gpus-per-node=8
 #SBATCH --mem=0
 #SBATCH --signal=SIGUSR1@120  # Send SIGUSR1 120 seconds before job end to allow for checkpointing by Lightning
 #SBATCH --output=/opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/slurm_out/%x-%j.out
@@ -69,12 +69,10 @@ export TORCH_DISTRIBUTED_DEBUG=INFO
 
 echo "env setup on head node ($HOSTNAME) finished, starting srun..."
 
-# --cpu-bind=none is critical to ensure that the dataloaders can use all CPUs
-srun --cpu-bind=none --jobid $SLURM_JOBID /bin/bash -c ' \
-echo MASTER_ADDR: $MASTER_ADDR, MASTER_PORT: $MASTER_PORT, SLURM_PROCID: $SLURM_PROCID && \
-echo local hostname: $(hostname) && \
-python src/train.py +slurm_job_id=$SLURM_JOBID trainer.num_nodes={nodes} experiment={experiment} \
-'
+echo MASTER_ADDR: $MASTER_ADDR, MASTER_PORT: $MASTER_PORT, SLURM_PROCID: $SLURM_PROCID
+echo local hostname: $(hostname)
+
+srun --cpu-bind=none python src/train.py +slurm_job_id=$SLURM_JOBID trainer.num_nodes={nodes} experiment={experiment}
 
 echo "srun finished. Job completed on $(date)"
 """

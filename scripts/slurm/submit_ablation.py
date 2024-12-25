@@ -37,7 +37,7 @@ def main():
 #SBATCH --mail-user=jianingy@meta.com
 #SBATCH --mail-type=BEGIN,END
 #SBATCH --account=3dfy
-#SBATCH --qos=3dfy_high
+#SBATCH --qos=perception_shared
 #SBATCH --nodes={nodes}
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=12
