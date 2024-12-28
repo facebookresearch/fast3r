@@ -27,7 +27,7 @@ conda activate fast3r
 # install PyTorch (adjust cuda version according to your system)
 conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia
 
-# Install PyTorch3D
+# Install PyTorch3D from source (the compilation will take a while)
 pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable"
 
 # install requirements
@@ -62,6 +62,22 @@ You can override any parameter from command line like this
 ```bash
 python src/train.py trainer.max_epochs=20 data.batch_size=64
 ```
+
+## License
+
+See [LICENSE](LICENSE) for details.
+```
+Copyright (c) Meta Platforms, Inc. and affiliates.
+All rights reserved.
+
+This source code is licensed under the license found in the
+LICENSE file in the root directory of this source tree.
+```
+
+
+## Contributing
+
+See [contributing](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Citation
 

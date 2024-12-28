@@ -13,7 +13,7 @@ from src.dust3r.model import FlashDUSt3R
 from src.models.fast3r import Fast3R
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from src.eval.cam_pose_metric import camera_to_rel_deg, calculate_auc
-from src.eval.recon_metric import accuracy, accuracy_faiss, completion, completion_faiss
+from src.eval.recon_metric import accuracy, completion
 from src.dust3r.cloud_opt.init_im_poses import fast_pnp
 import open3d as o3d
 import time

@@ -1,3 +1,6 @@
+logs
+
+notebooks/figures/
 notebooks/output/
 
 *.ply

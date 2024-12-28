@@ -114,7 +114,7 @@ def interpolate_pos_embed(model, checkpoint_model):
 # ----------------------------------------------------------
 
 try:
-    from croco.models.curope import cuRoPE2D
+    from src.croco.models.curope import cuRoPE2D
 
     RoPE2D = cuRoPE2D
 except ImportError:
