@@ -40,5 +40,5 @@ scikit-image
 scikit-learn
 scipy
 seaborn
-pyglet<2
+pyglet<3
 huggingface-hub[torch]>=0.22
