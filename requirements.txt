@@ -4,7 +4,7 @@ torchvision
 torchaudio
 lightning==2.3.0
 lightning-bolts==0.7.0
-lightning-utilities==0.11.2
+lightning-utilities==0.12.0
 torchmetrics==1.4.0
 torchinfo
 
