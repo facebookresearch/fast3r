@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - default
+
+task_name: fp32_bs1_views10
+
+data:
+  num_views: 10
+  data_module:
+    batch_size_per_device: 1

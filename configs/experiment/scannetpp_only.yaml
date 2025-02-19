@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - default
+
+task_name: fp32_bs6_views4_scannetpp_only
+
+data:
+  data_module:
+    train_datasets:
+      - 80_000 @ ScanNetpp_Multiview(split='train', num_views=${data.num_views}, window_size=${python_eval:"${data.num_views} * 2"}, num_samples_per_window=100, ROOT='${data.data_root}/scannetpp_processed', aug_crop=256, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)

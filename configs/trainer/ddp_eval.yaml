@@ -1,0 +1,16 @@
+defaults:
+  - default
+
+# strategy: ddp
+strategy:
+  _target_: lightning.pytorch.strategies.DDPStrategy
+  timeout:
+    _target_: datetime.timedelta
+    minutes: 30
+
+accelerator: gpu
+devices: auto
+num_nodes: 1
+sync_batchnorm: true
+
+use_distributed_sampler: false

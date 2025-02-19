@@ -1,0 +1,20 @@
+# @package _global_
+
+defaults:
+  - default
+  - override /model: fast3r
+
+task_name: fast3r_habitat_larger_decoder_views4
+
+
+data:
+  num_views: 4
+  data_module:
+    batch_size_per_device: 3
+
+model:
+  net:
+    decoder_args:
+      embed_dim: 1024
+      num_heads: 16
+      depth: 24

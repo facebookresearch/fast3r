@@ -1,0 +1,76 @@
+_target_: src.models.multiview_dust3r_module.MultiViewDUSt3RLitModule
+
+pretrained: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth
+resume_from_checkpoint: ${ckpt_path}
+
+train_criterion:
+  _target_: src.dust3r.losses.ConfLossMultiview
+  pixel_loss:
+    _target_: src.dust3r.losses.Regr3DMultiviewV2
+    criterion:
+      _target_: src.dust3r.losses.L21Loss
+    norm_mode: avg_dis
+  alpha: 0.2
+
+validation_criterion:
+  _target_: src.dust3r.losses.ConfLossMultiview
+  pixel_loss:
+    _target_: src.dust3r.losses.Regr3DMultiviewV2
+    criterion:
+      _target_: src.dust3r.losses.L21Loss
+    norm_mode: avg_dis
+  alpha: 0.2
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1e-4
+  betas: 
+    - 0.9
+    - 0.95
+  weight_decay: 0.05
+
+# scheduler:
+#   _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+#   _partial_: true
+#   mode: min
+#   factor: 0.1
+#   patience: 10
+
+scheduler:
+  _target_: pl_bolts.optimizers.lr_scheduler.LinearWarmupCosineAnnealingLR
+  _partial_: true
+  warmup_epochs: 10
+  max_epochs: ${trainer.max_epochs}
+  eta_min: 1e-06
+
+net:
+  _target_: src.dust3r.model.FlashDUSt3R
+  attn_implementation: flash_attention
+  pos_embed: RoPE100
+  patch_embed_cls: ManyAR_PatchEmbed
+  img_size: 
+    - 512
+    - 512
+  head_type: dpt
+  output_mode: pts3d
+  depth_mode: 
+    - exp
+    - !!float -inf
+    - !!float inf
+  conf_mode: 
+    - exp
+    - 1
+    - !!float inf
+  enc_embed_dim: 1024
+  enc_depth: 24
+  enc_num_heads: 16
+  dec_embed_dim: 768
+  dec_depth: 12
+  dec_num_heads: 12
+  random_image_idx_embedding: true
+
+
+
+# compile model for faster training with pytorch 2.0
+compile: false

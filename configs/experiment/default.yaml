@@ -1,0 +1,40 @@
+# @package _global_
+
+# defaults:
+#   - override /hydra/launcher: fair_a100
+
+# overwrite task name so logs are stored in separate folder
+task_name: "fp32_bs6_views4"
+
+# tags to help you identify your experiments
+# you can overwrite this in experiment configs
+# overwrite from command line with `python train.py tags="[first_tag, second_tag]"`
+tags: ["fp32", "flash_attn"]
+
+# ckpt_path: /some/random/path
+
+extras:
+  ignore_warnings: False
+  enforce_tags: False
+
+# sets level of all command line loggers to 'DEBUG'
+# https://hydra.cc/docs/tutorials/basic/running_your_app/logging/
+hydra:
+  job_logging:
+    root:
+      level: INFO
+
+data:
+  num_views: 4
+  data_module:
+    num_workers: 6
+    pin_memory: true
+    batch_size_per_device: 6
+
+trainer:
+  num_nodes: 1
+  devices: auto
+
+
+# seed for random number generators in pytorch, numpy and python.random
+seed: 42

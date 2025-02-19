@@ -1,0 +1,43 @@
+defaults:
+  - submitit_slurm
+
+# see: https://github.com/facebookresearch/hydra/blob/main/plugins/hydra_submitit_launcher/hydra_plugins/hydra_submitit_launcher/config.py
+_target_: hydra_plugins.hydra_submitit_launcher.submitit_launcher.SlurmLauncher
+submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+name: ${hydra.job.name}
+timeout_min: 20160 # 14 days : 60 * 24 * 14
+account: cortex
+qos: cortex_high
+comment: "multiview_dust3r experiment"
+nodes: 1
+gres: "gpu:8"
+tasks_per_node: 8
+cpus_per_task: 12
+signal_delay_s: 120 # USR1 signal delay (seconds) before timeout
+max_num_timeout: 0 # number of times the job can be restarted after timeout
+array_parallelism: 256     # Maximum number of jobs running in parallel
+
+# Useful to add parameters which are not currently available in the plugin.
+# Eg: {"mail-user": "blublu@fb.com", "mail-type": "BEGIN"}
+additional_parameters:
+  mail-user: "jianingy@meta.com"
+  mail-type: "BEGIN,END"
+  output: "/opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/slurm_out/%x-%j.out"
+
+setup: # A list of commands to run in sbatch befure running srun
+  - echo "Begin setting up env on head node ($HOSTNAME)..."
+  - echo $(env | grep SLURM)
+  - export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+  - export MASTER_PORT=9929
+  - export RDZV_ID=$SLURM_JOBID
+  - export OMP_NUM_THREADS=12
+  - . /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/miniforge3/etc/profile.d/conda.sh  # activate conda
+  - conda activate dust3r
+  - cd /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r  # cd to the project directory
+  - export NCCL_DEBUG=INFO
+  - export PYTHONFAULTHANDLER=1
+  - export TORCH_DISTRIBUTED_DEBUG=INFO
+  - echo "env setup on head node ($HOSTNAME) finished, starting srun..."
+
+srun_args:
+  - "--cpu-bind=none" # This is critical to ensure dataloaders uses all CPUs!

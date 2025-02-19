@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - default
+  - override /model: fast3r
+
+task_name: fast3r_co3d_only_views8
+
+
+data:
+  num_views: 8
+  data_module:
+    batch_size_per_device: 2
+    train_datasets:
+      - 80_000 @ Co3d_Multiview(split='train', num_views=${data.num_views}, window_degree_range=360, num_samples_per_window=100, ROOT='${data.data_root}/co3d_50_seqs_per_category_subset_processed', aug_crop=16, mask_bg='rand', resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)

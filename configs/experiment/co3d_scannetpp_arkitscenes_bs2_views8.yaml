@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - default
+
+task_name: co3d_scannetpp_arkitscenes_bs2_views8
+
+data:
+  num_views: 8
+  data_module:
+    batch_size_per_device: 2
+    train_datasets:
+      - 80_000 @ Co3d_Multiview(split='train', num_views=${data.num_views}, window_degree_range=360, num_samples_per_window=100, ROOT='${data.data_root}/co3d_50_seqs_per_category_subset_processed', aug_crop=16, mask_bg='rand', resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)
+      - 80_000 @ ScanNetpp_Multiview(split='train', num_views=${data.num_views}, window_size=${python_eval:"${data.num_views} * 2"}, num_samples_per_window=100, ROOT='${data.data_root}/scannetpp_processed', aug_crop=256, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)
+      - 80_000 @ ARKitScenes_Multiview(split='train', num_views=${data.num_views}, num_samples_per_window=10, ROOT='${data.data_root}/arkitscenes_processed', aug_crop=256, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)

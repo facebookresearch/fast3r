@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - data: multiview_dust3r
+  - model: fast3r
+  - logger: many_loggers
+  - trainer: ddp_eval
+  - paths: default
+  - extras: default
+  - hydra: default
+  - eval: default
+
+task_name: "eval"
+
+tags: ["eval"]
+
+# passing checkpoint path is necessary for evaluation
+ckpt_path: ???

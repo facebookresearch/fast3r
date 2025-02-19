@@ -1,0 +1,48 @@
+# @package _global_
+
+#use a smaller dataset for faster initializations
+defaults:
+  - override /data: multiview_dust3r_tiny
+  - override /logger:
+    - csv
+    - wandb
+
+# overwrite task name so debugging logs are stored in separate folder
+task_name: "debug"
+
+logger:
+  wandb:
+    name: ${paths.run_folder_name}
+
+# ckpt_path: /some/random/path
+
+extras:
+  ignore_warnings: False
+  enforce_tags: False
+
+# sets level of all command line loggers to 'DEBUG'
+# https://hydra.cc/docs/tutorials/basic/running_your_app/logging/
+hydra:
+  job_logging:
+    root:
+      level: DEBUG
+
+model:
+  net:
+    random_image_idx_embedding: true
+
+data:
+  num_views: 4
+  data_module:
+    num_workers: 0 # debuggers don't like multiprocessing
+    pin_memory: false # disable gpu memory pin
+    batch_size_per_device: 6
+
+trainer:
+  log_every_n_steps: 1
+  devices: auto
+  # fast_dev_run: 1
+  limit_train_batches: 1
+  limit_val_batches: 10000
+  precision: 32
+

@@ -1,0 +1,8 @@
+# @package _global_
+
+defaults:
+  - default
+
+trainer:
+  precision: bf16-mixed
+

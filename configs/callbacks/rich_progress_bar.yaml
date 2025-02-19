@@ -1,0 +1,18 @@
+# https://lightning.ai/docs/pytorch/latest/api/lightning.pytorch.callbacks.RichProgressBar.html
+
+rich_progress_bar:
+  _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBar
+  refresh_rate: 1
+  leave: false
+  theme:
+    _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
+    description: green_yellow
+    progress_bar: green1
+    progress_bar_finished: green1
+    progress_bar_pulse: "#6206E0"
+    batch_progress: green_yellow
+    time: blue
+    processing_speed: cyan
+    metrics: grey82
+    metrics_text_delimiter: " "
+    metrics_format: .4g

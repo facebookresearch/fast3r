@@ -1,0 +1,31 @@
+# @package _global_
+
+defaults:
+  - default
+  - override /model: fast3r
+
+task_name: fast3r_dino
+
+data:
+  num_views: 4
+  data_module:
+    batch_size_per_device: 6
+    train_datasets:
+      - 80_000 @ Co3d_Multiview(split='train', num_views=${data.num_views}, window_degree_range=360, num_samples_per_window=100, ROOT='${data.data_root}/co3d_50_seqs_per_category_subset_processed', aug_crop=16, mask_bg='rand', resolution=[(448, 336), (448, 294), (448, 252), (448, 224), (448, 140)], transform=ColorJitter)
+      - 80_000 @ ScanNetpp_Multiview(split='train', num_views=${data.num_views}, window_size=${python_eval:"${data.num_views} * 2"}, num_samples_per_window=100, ROOT='${data.data_root}/scannetpp_processed', aug_crop=256, resolution=[(448, 336), (448, 294), (448, 252), (448, 224), (448, 140)], transform=ColorJitter)
+      - 80_000 @ ARKitScenes_Multiview(split='train', num_views=${data.num_views}, num_samples_per_window=10, ROOT='${data.data_root}/arkitscenes_processed', aug_crop=256, resolution=[(448, 336), (448, 294), (448, 252), (448, 224), (448, 140)], transform=ColorJitter)
+    validation_datasets:
+      - 100 @ Co3d_Multiview(split='test', num_views=${data.num_views_val}, window_degree_range=360, num_samples_per_window=100, ROOT='${data.data_root}/co3d_50_seqs_per_category_subset_processed', resolution=(448, 336), seed=777)
+      - 100 @ MegaDepth_Multiview(split='val', num_views=${data.num_views_val}, window_size=${python_eval:"${data.num_views_val} * 2"}, num_samples_per_window=100, ROOT='${data.data_root}/megadepth_processed', resolution=(448, 336), seed=777)
+      - 100 @ ScanNetpp_Multiview(split='train', num_views=${data.num_views_val}, window_size=${python_eval:"${data.num_views_val} * 2"}, num_samples_per_window=100, ROOT='${data.data_root}/scannetpp_processed', resolution=(448, 336), seed=777)
+      - 100 @ ARKitScenes_Multiview(split='train', num_views=${data.num_views_val}, num_samples_per_window=10, ROOT='${data.data_root}/arkitscenes_processed', resolution=(448, 336), seed=777)
+      - 100 @ Habitat_Multiview(100_000, split='val', num_views=${data.num_views_val}, ROOT='${data.data_root}/habitat_processed', resolution=(448, 336), seed=777)
+
+model:
+  net:
+    encoder_args:
+      encoder_type: dino_v2
+      patch_size: 14
+    head_args:
+      patch_size: 14
+

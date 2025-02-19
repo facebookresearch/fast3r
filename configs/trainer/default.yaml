@@ -1,0 +1,30 @@
+_target_: lightning.pytorch.trainer.Trainer
+_convert_: partial
+
+default_root_dir: ${paths.output_dir}
+
+min_epochs: 1 # prevents early stopping
+max_epochs: 100
+
+accelerator: cpu
+devices: 1
+
+# mixed precision for extra speed-up
+# precision: 16
+
+# perform a validation loop every N training epochs
+check_val_every_n_epoch: 1
+
+# set True to to ensure deterministic results
+# makes training slower but gives more reproducibility than just setting seeds
+deterministic: False
+
+plugins:
+  - _target_: lightning.pytorch.plugins.environments.SLURMEnvironment
+    auto_requeue: true  # auto-resubmit the job when it is preempted by slurm
+    requeue_signal: ${python_eval:"signal.SIGUSR1"}  # singal code is platform dependent, so it has to be decided at runtime
+    # requeue_signal:
+    #   _target_: signal.Signals
+    #   _args_: 
+    #     - 10  # SIGUSR1, see: https://chromium.googlesource.com/chromiumos/docs/+/master/constants/signals.md
+

@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - default
+
+# ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/fast3r_habitat_larger_decoder_views4/runs/fast3r_habitat_larger_decoder_views4_4383740/checkpoints/last.ckpt
+ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/fast3r_co3d_scannetpp_arkitscenes_better_random_pose_emb/runs/fast3r_co3d_scannetpp_arkitscenes_better_random_pose_emb_4365927/checkpoints/last.ckpt
+# ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/fast3r_larger_decoder_bs1_views4/runs/fast3r_larger_decoder_4371625/checkpoints/last.ckpt
+# ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/fast3r_co3d_only_views8/runs/fast3r_co3d_only_views8_4439657/checkpoints/last.ckpt
+
+data:
+  num_views_val: 10
+  data_module:
+    validation_datasets:
+      - 100 @ Co3d_Multiview(split='test', num_views=${data.num_views_val}, window_degree_range=360, num_samples_per_window=100, ROOT='${data.data_root}/co3d_50_seqs_per_category_subset_processed', resolution=(512, 384), seed=777)
+      - 100 @ Habitat_Multiview(100_000, split='val', num_views=${data.num_views_val}, ROOT='${data.data_root}/habitat_processed', resolution=(512,384), seed=777)
+    num_workers: 0 # debuggers don't like multiprocessing
+    pin_memory: false # disable gpu memory pin
+    batch_size_per_device: 6

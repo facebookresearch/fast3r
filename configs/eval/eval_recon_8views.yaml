@@ -1,0 +1,23 @@
+# @package _global_
+
+defaults:
+  - default
+
+task_name: eval_recon_8views
+
+ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/fast3r_local_head_habitat_better_scannetpp_8views/runs/fast3r_local_head_habitat_better_scannetpp_8views_4726417/checkpoints/last.ckpt
+# ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/fast3r_local_head_better_scannetpp_and_arkit_pretrained_16views/runs/fast3r_local_head_better_scannetpp_and_arkit_pretrained_16views_4793676/checkpoints/last.ckpt
+# ckpt_path: /opt/hpcaas/.mounts/fs-0565f60d669b6a2d3/home/jianingy/research/accel-cortex/dust3r/fast3r/logs/fast3r_local_head_better_scannetpp_and_arkit_pretrained_20views_small_lr/runs/fast3r_local_head_better_scannetpp_and_arkit_pretrained_20views_small_lr_4804512/checkpoints/last.ckpt
+
+data:
+  num_views_val: 10
+  data_module:
+    validation_datasets:
+      - 100 @ Co3d_Multiview(split='test', num_views=${data.num_views_val}, window_degree_range=360, num_samples_per_window=100, ROOT='${data.data_root}/co3d_50_seqs_per_category_subset_processed', resolution=(512, 384), seed=777)
+      # - DTU(split='test', ROOT='${data.data_root}/dtu_test_mvsnet_release', resolution=(512, 384), num_seq=1, full_video=True, kf_every=5)
+      # - SevenScenes(split='test', ROOT='${data.data_root}/7_scenes_processed', resolution=(512, 384), num_seq=1, full_video=True, kf_every=20)
+      # - NRGBD(split='test', ROOT='${data.data_root}/neural_rgbd', resolution=(512, 384), num_seq=1, full_video=True, kf_every=40)
+    num_workers: 0 # debuggers don't like multiprocessing
+    pin_memory: true # disable gpu memory pin
+    batch_size_per_device: 6
+    batch_size_per_device_val: 1
