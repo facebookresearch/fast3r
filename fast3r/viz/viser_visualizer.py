@@ -256,9 +256,9 @@ def start_visualization(output, min_conf_thr_percentile=10, global_conf_thr_valu
         img_rgb_orig = to_numpy(view['img'].cpu().squeeze().permute(1,2,0))
         not_sky_mask = detect_sky_mask(img_rgb_orig).flatten().astype(np.int8)
 
-        pts3d_global = to_numpy(pred['pts3d_in_other_view'].cpu().squeeze()).reshape(-1, 3)
+        pts3d_global = to_numpy(pred['pts3d_local_aligned_to_global'].cpu().squeeze()).reshape(-1, 3)
         conf_global = to_numpy(pred['conf'].cpu().squeeze()).flatten()
-        pts3d_local = to_numpy(pred['pts3d_local_aligned_to_global'].cpu().squeeze()).reshape(-1, 3)
+        pts3d_local = to_numpy(pred['pts3d_in_other_view'].cpu().squeeze()).reshape(-1, 3)
         conf_local = to_numpy(pred['conf_local'].cpu().squeeze()).flatten()
         img_rgb = to_numpy(view['img'].cpu().squeeze().permute(1,2,0))
         img_rgb_flat = img_rgb.reshape(-1, 3)
