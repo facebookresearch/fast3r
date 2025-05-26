@@ -234,6 +234,11 @@ class ViserServerManager:
 # -------------------------------
 # start_manager
 # -------------------------------
+def _manager_run(req_queue, resp_queue):
+    mgr = ViserServerManager(req_queue, resp_queue)
+    mgr.run()
+
+
 def start_manager():
     """
     Starts the ViserServerManager.
@@ -242,7 +247,10 @@ def start_manager():
     """
     req_queue = mp.Queue()
     resp_queue = mp.Queue()
-    manager_process = mp.Process(target=ViserServerManager(req_queue, resp_queue).run)
+    manager_process = mp.Process(
+        target=_manager_run,
+        args=(req_queue, resp_queue),
+    )
     manager_process.start()
     return req_queue, resp_queue, manager_process
 
